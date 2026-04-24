@@ -1,0 +1,26 @@
+[package]
+name = "eq-audio"
+version = "0.1.0"
+edition = "2021"
+
+# eq-audio is the Windows audio I/O layer.
+# It depends on eq-core for DSP and on windows-rs for WASAPI.
+# All platform-specific code lives here so eq-core stays pure.
+
+[dependencies]
+eq-core = { path = "../eq-core" }
+
+# windows-rs gives us safe Rust bindings to the Win32 API.
+# Features are kept minimal — only what WASAPI loopback capture needs.
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",                    # IAudioClient, IAudioRenderClient, IAudioCaptureClient, IMMDevice*, IAudioSessionManager2
+    "Win32_Media_Multimedia",               # KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+    "Win32_System_Com",                     # CoInitializeEx, CoCreateInstance, CoTaskMemFree, STGM
+    "Win32_System_Com_StructuredStorage",   # PROPVARIANT, PropVariantClear
+    "Win32_Foundation",                     # PWSTR, PCWSTR, GUID, CloseHandle
+    "Win32_UI_Shell_PropertiesSystem",      # IPropertyStore
+    "Win32_System_Threading",              # OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION
+] }
+
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }

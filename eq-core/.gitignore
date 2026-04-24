@@ -1,0 +1,24 @@
+# Rust build output
+target/
+Cargo.lock
+
+# Node / frontend
+node_modules/
+dist/
+.tauri/
+
+# Tauri build output
+src-tauri/target/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# Env files (never commit these)
+.env
+.env.local

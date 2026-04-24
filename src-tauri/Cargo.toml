@@ -1,0 +1,26 @@
+[package]
+name = "soundeq"
+version = "0.1.0"
+edition = "2021"
+
+# The lib target is required for Tauri's generate_context! macro and for
+# mobile targets. The binary in main.rs just calls soundeq_lib::run().
+[lib]
+name = "soundeq_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+winreg = "0.55"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+eq-core = { path = "../eq-core" }
+eq-audio = { path = "../eq-audio" }
+
+# custom-protocol is enabled by tauri bundle so the frontend assets are
+# served over the tauri:// protocol instead of http://localhost in production.
+[features]
+custom-protocol = ["tauri/custom-protocol"]

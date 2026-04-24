@@ -1,0 +1,24 @@
+[package]
+name = "eq-core"
+version = "0.1.0"
+edition = "2021"
+
+# This is a pure library — no binary, no UI, no OS dependencies.
+# It will later be embedded into the Tauri backend as a dependency.
+[lib]
+name = "eq_core"
+path = "src/lib.rs"
+
+[dependencies]
+# serde lets us serialize/deserialize filter configs to/from JSON
+# (needed when saving/loading presets later)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# thiserror generates boilerplate for custom error types via derive macros
+thiserror = "1.0"
+
+[dev-dependencies]
+# approx gives us assert_relative_eq! for floating-point test comparisons
+# (exact float equality is unreliable due to rounding errors)
+approx = "0.5"
+

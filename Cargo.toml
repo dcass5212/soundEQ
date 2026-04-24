@@ -1,0 +1,3 @@
+[workspace]
+members = ["eq-core", "eq-audio", "src-tauri"]
+resolver = "2"
