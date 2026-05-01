@@ -23,3 +23,11 @@ Thumbs.db
 # Claude Code internals
 .claude/
 *.gitignore.txt
+
+# Personal notes and scratch files
+*.md.bak
+airpod incident.md
+bash.exe.stackdump
+test-dll-load.ps1
+add-to-start-menu.vbs
+run.vbs

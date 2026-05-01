@@ -22,6 +22,7 @@ pub mod biquad;
 pub mod filter_chain;
 pub mod profile;
 pub mod preset;
+pub mod crossfeed;
 
 // Re-export the most commonly used types at the crate root for convenience.
 // Downstream code can do `use eq_core::FilterChain` instead of the full path.
@@ -30,3 +31,4 @@ pub use biquad::{BiquadFilter, Coefficients};
 pub use filter_chain::{FilterChain, MAX_BANDS};
 pub use profile::{Profile, ProfileStore, ProfileError, DEFAULT_PROFILE_NAME};
 pub use preset::builtin_presets;
+pub use crossfeed::{CrossfeedConfig, CrossfeedLevel, CrossfeedProcessor};

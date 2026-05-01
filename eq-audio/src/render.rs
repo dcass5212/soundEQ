@@ -36,7 +36,7 @@
 use std::collections::VecDeque;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -157,6 +157,13 @@ pub struct WasapiRenderer {
     stop_flag: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
     ring: Arc<Mutex<SampleBuffer>>,
+    /// Current volume scalar as f32 bits. Written by VolumeMonitor every 50 ms;
+    /// read by the render loop every buffer. Default 1.0 = full volume.
+    volume: Arc<AtomicU32>,
+    /// User-controlled output gain as f32 bits. Multiplied with `volume` in
+    /// the render loop. Default 1.0. Allows compensating for VB-Cable's lower
+    /// inherent signal level relative to direct device output.
+    output_gain: Arc<AtomicU32>,
 }
 
 impl WasapiRenderer {
@@ -170,7 +177,21 @@ impl WasapiRenderer {
             stop_flag: Arc::new(AtomicBool::new(false)),
             thread_handle: None,
             ring: Arc::new(Mutex::new(SampleBuffer::new(ring_capacity))),
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            output_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         }
+    }
+
+    /// Returns the volume Arc so `VolumeMonitor` can write into it.
+    /// Call this after `new()` and before `start()`.
+    pub fn volume_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.volume)
+    }
+
+    /// Returns the output-gain Arc so callers can update the gain live.
+    /// Write a f32 value (clamped to [0.0, 4.0] by the render loop) as bits.
+    pub fn gain_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.output_gain)
     }
 
     /// Returns a `RenderSender` that can be used to push audio into the render queue.
@@ -196,10 +217,12 @@ impl WasapiRenderer {
         let stop_flag = Arc::clone(&self.stop_flag);
         let ring = Arc::clone(&self.ring);
 
+        let volume = Arc::clone(&self.volume);
+        let output_gain = Arc::clone(&self.output_gain);
         let handle = thread::Builder::new()
             .name("wasapi-render".to_string())
             .spawn(move || {
-                render_thread_main(stop_flag, ring, device_id, format_tx);
+                render_thread_main(stop_flag, ring, device_id, format_tx, volume, output_gain);
             })?;
 
         self.thread_handle = Some(handle);
@@ -217,6 +240,17 @@ impl WasapiRenderer {
     /// Returns true if the render thread is currently active.
     pub fn is_running(&self) -> bool {
         self.thread_handle.is_some()
+    }
+
+    /// Returns true if the render thread exited on its own due to a device
+    /// error — i.e., the thread finished but the stop flag was never set.
+    ///
+    /// Mirrors `LoopbackCapture::has_crashed()`. See that doc for details.
+    pub fn has_crashed(&self) -> bool {
+        self.thread_handle
+            .as_ref()
+            .map_or(false, |h| h.is_finished())
+            && !self.stop_flag.load(Ordering::Relaxed)
     }
 }
 
@@ -241,6 +275,8 @@ fn render_thread_main(
     ring: Arc<Mutex<SampleBuffer>>,
     device_id: Option<String>,
     format_tx: SyncSender<Result<StreamFormat, AudioError>>,
+    volume: Arc<AtomicU32>,
+    output_gain: Arc<AtomicU32>,
 ) {
     // COM must be initialised per-thread.
     // _com must be declared FIRST so it is dropped LAST (after all COM objects).
@@ -274,6 +310,8 @@ fn render_thread_main(
         &render_client,
         &format,
         sleep_duration,
+        &volume,
+        &output_gain,
     );
 
     let _ = unsafe { audio_client.Stop() };
@@ -286,6 +324,8 @@ fn run_render_loop(
     render_client: &IAudioRenderClient,
     format: &StreamFormat,
     sleep_duration: Duration,
+    volume: &AtomicU32,
+    output_gain: &AtomicU32,
 ) {
     while !stop_flag.load(Ordering::Relaxed) {
         thread::sleep(sleep_duration);
@@ -352,6 +392,22 @@ fn run_render_loop(
                 render_slice[dst] = l;
                 render_slice[dst + 1] = r;
                 render_slice[dst + 2..dst + ch].fill(0.0);
+            }
+        }
+
+        // Apply volume scaling: VolumeMonitor scalar (mirrors the Windows slider)
+        // multiplied by the user-controlled output gain (compensates for VB-Cable's
+        // inherent lower signal level vs. direct device output).
+        //
+        // Both are stored as f32 bits in atomics so the render thread reads them
+        // without locking. We clamp after multiplying to prevent digital clipping
+        // when gain > 1.0 boosts a loud signal above 0 dBFS.
+        let vol  = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
+        let gain = f32::from_bits(output_gain.load(Ordering::Relaxed)).clamp(0.0, 4.0);
+        let combined = vol * gain;
+        if (combined - 1.0).abs() > 0.0001 {
+            for s in render_slice.iter_mut() {
+                *s = (*s * combined).clamp(-1.0, 1.0);
             }
         }
 

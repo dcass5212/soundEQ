@@ -1,0 +1,38 @@
+[package]
+name = "eq-apo"
+version = "0.1.0"
+edition = "2021"
+
+# cdylib — Windows loads this as a DLL into audiodg.exe via COM activation.
+# The DLL must export DllGetClassObject and DllCanUnloadNow (see lib.rs).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# eq-core provides FilterChain, Profile, BandConfig — the DSP engine.
+eq-core = { path = "../eq-core" }
+
+# serde + serde_json: deserialize the active_profile.json written by the Tauri app.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# windows-core must be a *direct* dependency because the #[implement] macro
+# expands to code referencing ::windows_core at the crate root. Without this
+# explicit dep the macro fails even though windows re-exports windows-core.
+windows-core = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    # "implement" exposes the _Impl traits required for COM interface impl blocks.
+    "implement",
+    # Core COM infrastructure
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    # APO-specific interfaces (IAudioProcessingObject, IAudioMediaType, etc.)
+    "Win32_Media_Audio_Apo",
+    # HSTRING / PROPVARIANT helpers used in APO initialization
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+]

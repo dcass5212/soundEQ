@@ -7,6 +7,8 @@
 // speakers as the Output device in soundEQ.
 // =============================================================================
 
+import { openVbCableDownload } from "../lib/api";
+
 interface SetupBannerProps {
   onDismiss: () => void;
 }
@@ -16,19 +18,21 @@ export function SetupBanner({ onDismiss }: SetupBannerProps) {
     <div className="flex-shrink-0 flex items-start gap-3 px-4 py-2.5 bg-amber-950 border-b border-amber-800 text-amber-200 text-xs">
       <span className="mt-0.5 shrink-0 text-amber-400 font-bold">!</span>
 
-      <div className="flex-1 space-y-1">
-        <p className="font-semibold text-amber-100">Virtual audio cable not found</p>
-        <p className="text-amber-300 leading-relaxed">
-          soundEQ needs a virtual audio cable to intercept system audio. Follow
-          these steps:
-        </p>
+      <div className="flex-1 space-y-1.5">
+        <p className="font-semibold text-amber-100">VB-Cable not found — required for soundEQ</p>
         <ol className="list-decimal list-inside space-y-0.5 text-amber-300">
           <li>
-            Search for <span className="font-mono text-amber-100">VB-Audio Virtual Cable</span> and
-            install the free driver.
+            Download and install the free{" "}
+            <button
+              onClick={() => openVbCableDownload().catch(() => {})}
+              className="font-mono text-amber-100 underline underline-offset-2 hover:text-white transition-colors"
+            >
+              VB-Audio Virtual Cable
+            </button>{" "}
+            driver.
           </li>
           <li>
-            Open <span className="font-mono text-amber-100">Windows Sound settings</span> and set{" "}
+            Open <span className="font-mono text-amber-100">Windows Sound Settings</span> and set{" "}
             <span className="font-mono text-amber-100">CABLE Input</span> as your default output
             device — this routes all app audio through soundEQ.
           </li>
@@ -38,11 +42,6 @@ export function SetupBanner({ onDismiss }: SetupBannerProps) {
           </li>
           <li>Press <span className="font-mono text-amber-100">Start</span>.</li>
         </ol>
-        <p className="text-amber-500 text-[11px]">
-          Once VB-Cable is installed, the{" "}
-          <span className="font-mono">Capture</span> dropdown will automatically
-          select it.
-        </p>
       </div>
 
       <button

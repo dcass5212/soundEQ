@@ -49,7 +49,7 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED,
 };
 
-use eq_core::FilterChain;
+use eq_core::{CrossfeedProcessor, FilterChain};
 
 use crate::error::AudioError;
 
@@ -130,6 +130,7 @@ impl LoopbackCapture {
         &mut self,
         capture_device_id: Option<String>,
         filter_chain: Arc<Mutex<FilterChain>>,
+        crossfeed: Arc<Mutex<CrossfeedProcessor>>,
         on_processed: impl FnMut(&[f32]) + Send + 'static,
     ) -> Result<StreamFormat, AudioError> {
         if self.thread_handle.is_some() {
@@ -149,7 +150,7 @@ impl LoopbackCapture {
         let handle = thread::Builder::new()
             .name("wasapi-loopback-capture".to_string())
             .spawn(move || {
-                capture_thread_main(stop_flag, filter_chain, format_tx, on_processed, capture_device_id);
+                capture_thread_main(stop_flag, filter_chain, crossfeed, format_tx, on_processed, capture_device_id);
             })?;
 
         self.thread_handle = Some(handle);
@@ -174,6 +175,19 @@ impl LoopbackCapture {
     /// Returns true if a capture session is currently active.
     pub fn is_running(&self) -> bool {
         self.thread_handle.is_some()
+    }
+
+    /// Returns true if the capture thread exited on its own due to a device
+    /// error — i.e., the thread finished but the stop flag was never set.
+    ///
+    /// This distinguishes an abnormal exit (device unplugged / WASAPI
+    /// invalidated) from a normal stop() call, so the engine can decide
+    /// whether to attempt an automatic restart.
+    pub fn has_crashed(&self) -> bool {
+        self.thread_handle
+            .as_ref()
+            .map_or(false, |h| h.is_finished())
+            && !self.stop_flag.load(Ordering::Relaxed)
     }
 }
 
@@ -204,6 +218,7 @@ impl Drop for LoopbackCapture {
 fn capture_thread_main(
     stop_flag: Arc<AtomicBool>,
     filter_chain: Arc<Mutex<FilterChain>>,
+    crossfeed: Arc<Mutex<CrossfeedProcessor>>,
     format_tx: SyncSender<Result<StreamFormat, AudioError>>,
     mut on_processed: impl FnMut(&[f32]),
     capture_device_id: Option<String>,
@@ -233,6 +248,13 @@ fn capture_thread_main(
         chain.set_sample_rate(format.sample_rate as f64);
     }
 
+    // Align the crossfeed processor's delay length and LP filter to the actual
+    // device sample rate. Must happen before the first audio buffer is processed.
+    {
+        let mut cf = crossfeed.lock().unwrap();
+        cf.set_sample_rate(format.sample_rate as f64);
+    }
+
     // unsafe: Start() has no invariants beyond the audio client being properly
     // initialised, which open_loopback() guarantees before returning.
     if let Err(e) = unsafe { audio_client.Start() } {
@@ -248,6 +270,7 @@ fn capture_thread_main(
     run_capture_loop(
         &stop_flag,
         &filter_chain,
+        &crossfeed,
         &capture_client,
         &format,
         &mut processing_buf,
@@ -265,6 +288,7 @@ fn capture_thread_main(
 fn run_capture_loop(
     stop_flag: &AtomicBool,
     filter_chain: &Mutex<FilterChain>,
+    crossfeed: &Mutex<CrossfeedProcessor>,
     capture_client: &IAudioCaptureClient,
     format: &StreamFormat,
     processing_buf: &mut Vec<f32>,
@@ -340,6 +364,14 @@ fn run_capture_loop(
                 {
                     let mut chain = filter_chain.lock().unwrap();
                     chain.process_interleaved(processing_buf);
+                }
+
+                // Apply crossfeed after the EQ chain so the EQ shapes the
+                // signal first and crossfeed then naturalises the stereo image.
+                // No-op when crossfeed is disabled (immediate return in processor).
+                {
+                    let mut cf = crossfeed.lock().unwrap();
+                    cf.process_interleaved(processing_buf);
                 }
 
                 on_processed(processing_buf);

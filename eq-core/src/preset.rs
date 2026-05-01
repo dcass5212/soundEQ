@@ -185,6 +185,7 @@ fn band(filter_type: FilterType, frequency: f64, gain_db: f64, q: f64) -> BandCo
         gain_db,
         q,
         enabled: true,
+        color: None,
     }
 }
 

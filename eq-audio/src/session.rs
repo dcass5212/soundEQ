@@ -27,10 +27,12 @@
 //   - list_audio_sessions() → Vec<AudioSessionInfo> of all active sessions
 // =============================================================================
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HWND};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 use windows::Win32::Media::Audio::{
+    AudioSessionStateActive,
     IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
-    IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -68,11 +70,43 @@ pub struct AudioSessionInfo {
 // list_audio_sessions
 // ---------------------------------------------------------------------------
 
-/// Returns all active WASAPI audio sessions on the default render endpoint.
+/// Returns the executable name (e.g. "spotify.exe") of the process that owns
+/// the currently focused foreground window.
 ///
-/// Sessions with PID 0 (system/cross-process sessions) are included but will
-/// have an empty `process_name`. Filter these out if only user-app sessions
-/// are needed.
+/// Returns `None` when:
+///   - No foreground window exists (desktop, screensaver, UAC prompt)
+///   - The window's process cannot be opened (elevated process, system)
+///
+/// This is used by the focus-based routing engine to automatically switch EQ
+/// profiles when the user tabs between applications.
+pub fn get_foreground_process_name() -> Option<String> {
+    // GetForegroundWindow returns the window that currently has keyboard focus.
+    // Returns HWND(0) when no window is in the foreground.
+    let hwnd: HWND = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+
+    // GetWindowThreadProcessId fills in the owning process ID.
+    // The return value is the thread ID — we only need the PID.
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+
+    process_name_from_pid(pid)
+}
+
+/// Returns WASAPI audio sessions that are currently streaming audio
+/// (state == AudioSessionStateActive) on the default render endpoint.
+///
+/// Inactive sessions (paused apps, background processes with no live stream)
+/// are excluded so the routing engine only routes based on apps that are
+/// actually producing audio right now.
+///
+/// Sessions with PID 0 (system/cross-process sessions) have an empty
+/// `process_name` and are filtered out by the routing layer.
 pub fn list_audio_sessions() -> Result<Vec<AudioSessionInfo>, AudioError> {
     // ComGuard is declared first so it is dropped last — after all COM
     // interface pointers have been released — to satisfy COM lifetime rules.
@@ -103,6 +137,17 @@ pub fn list_audio_sessions() -> Result<Vec<AudioSessionInfo>, AudioError> {
         let ctrl = unsafe { session_enum.GetSession(i)? };
         let ctrl2: IAudioSessionControl2 = ctrl.cast()?;
 
+        // Only consider sessions that are actively streaming audio.
+        // AudioSessionStateActive means the session has at least one running
+        // audio stream. Inactive sessions (paused apps, background processes
+        // with no current audio) are excluded so they don't win the routing
+        // lottery and override a currently-playing app's profile.
+        // GetState() is inherited from IAudioSessionControl (the base interface).
+        let state = unsafe { ctrl2.GetState().unwrap_or(AudioSessionStateActive) };
+        if state != AudioSessionStateActive {
+            continue;
+        }
+
         // GetProcessId can fail for system-level sessions — treat those as PID 0.
         let pid = unsafe { ctrl2.GetProcessId().unwrap_or(0) };
 
@@ -119,7 +164,84 @@ pub fn list_audio_sessions() -> Result<Vec<AudioSessionInfo>, AudioError> {
         sessions.push(AudioSessionInfo { pid, process_name, session_id });
     }
 
+    // WASAPI creates multiple sessions per process (one per audio stream, e.g.
+    // each Chrome tab with audio gets its own session). Deduplicate by
+    // process_name so the same exe only appears once in the list.
+    // System sessions (empty process_name) are all kept because they are
+    // filtered out at the UI layer anyway.
+    let mut seen = std::collections::HashSet::new();
+    sessions.retain(|s| s.process_name.is_empty() || seen.insert(s.process_name.clone()));
+
     Ok(sessions)
+}
+
+// ---------------------------------------------------------------------------
+// set_process_volume
+// ---------------------------------------------------------------------------
+
+/// Sets the WASAPI session volume for every active audio session owned by
+/// `process_name` on the default render endpoint.
+///
+/// `volume` is a linear scalar in [0.0, 1.0] where 1.0 = full session volume
+/// and 0.0 = silent. This controls only that application's WASAPI session —
+/// it does not touch the master Windows volume or any other app.
+///
+/// WASAPI creates one session per audio stream per process (e.g. each Chrome
+/// tab with audio gets its own session). This function iterates all sessions and
+/// applies the volume to every session that matches the process name, so apps
+/// with multiple audio streams are handled correctly.
+///
+/// No-op when no active session matches `process_name`.
+pub fn set_process_volume(process_name: &str, volume: f32) -> Result<(), AudioError> {
+    let _com = ComGuard::init()?;
+
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+
+    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
+
+    let manager: IAudioSessionManager2 =
+        unsafe { device.Activate(CLSCTX_ALL, None)? };
+
+    let session_enum: IAudioSessionEnumerator =
+        unsafe { manager.GetSessionEnumerator()? };
+
+    let count = unsafe { session_enum.GetCount()? };
+    let clamped = volume.clamp(0.0, 1.0);
+
+    for i in 0..count {
+        let ctrl = unsafe { session_enum.GetSession(i)? };
+        let ctrl2: IAudioSessionControl2 = ctrl.cast()?;
+
+        let pid = unsafe { ctrl2.GetProcessId().unwrap_or(0) };
+        if pid == 0 {
+            continue;
+        }
+
+        let name = process_name_from_pid(pid).unwrap_or_default();
+        if !name.eq_ignore_ascii_case(process_name) {
+            continue;
+        }
+
+        // ISimpleAudioVolume controls per-session volume independently of the
+        // master and application mixer volumes. Cast is always available on a
+        // valid IAudioSessionControl COM pointer — all session controls implement
+        // both interfaces on the same underlying COM object.
+        //
+        // SAFETY: ctrl is a valid IAudioSessionControl COM pointer; cast() is
+        // a windows-rs QI call that returns Err on interface mismatch.
+        if let Ok(vol_ctrl) = ctrl.cast::<ISimpleAudioVolume>() {
+            // SetMasterVolume accepts a float [0,1] and an optional event-context
+            // GUID used to identify the caller in IAudioSessionEvents notifications.
+            // We pass null because we don't subscribe to session change callbacks.
+            // SAFETY: null is a valid value for the optional event-context pointer.
+            unsafe {
+                let _ = vol_ctrl.SetMasterVolume(clamped, std::ptr::null());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

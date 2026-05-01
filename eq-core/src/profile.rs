@@ -19,11 +19,12 @@
 //   Heap allocation here is fine.
 // =============================================================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::crossfeed::CrossfeedConfig;
 use crate::filter_chain::{FilterChain, MAX_BANDS};
 use crate::filter_type::BandConfig;
 
@@ -59,6 +60,10 @@ pub enum ProfileError {
     /// Attempted to set as default a profile that doesn't exist in the store.
     #[error("cannot set default to '{0}': profile not found")]
     DefaultNotFound(String),
+
+    /// Attempted to rename a profile to an empty or whitespace-only string.
+    #[error("profile name cannot be empty")]
+    EmptyName,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +84,12 @@ pub struct Profile {
     /// The EQ bands that define this profile's sound.
     /// Order matters — bands are applied in sequence by FilterChain.
     pub bands: Vec<BandConfig>,
+
+    /// Headphone crossfeed settings for this profile.
+    /// #[serde(default)] means old saved profiles without this field load cleanly
+    /// (they get crossfeed disabled, which is the correct backward-compatible default).
+    #[serde(default)]
+    pub crossfeed: CrossfeedConfig,
 }
 
 impl Profile {
@@ -88,6 +99,7 @@ impl Profile {
         Self {
             name: name.into(),
             bands: Vec::new(),
+            crossfeed: CrossfeedConfig::default(),
         }
     }
 
@@ -96,6 +108,7 @@ impl Profile {
         Self {
             name: name.into(),
             bands,
+            crossfeed: CrossfeedConfig::default(),
         }
     }
 
@@ -161,6 +174,20 @@ pub struct ProfileStore {
     /// The profile used for any app that has no explicit assignment.
     /// Always points to a name present in `profiles`.
     default_profile_name: String,
+
+    /// Apps whose auto-switching is disabled. The assignment is kept so the
+    /// user doesn't have to re-enter the profile; focus_tick just skips them.
+    /// `#[serde(default)]` makes this field optional in stored JSON so old
+    /// saves without this field load cleanly (default = empty set = all enabled).
+    #[serde(default)]
+    disabled_apps: HashSet<String>,
+
+    /// Per-app WASAPI session volume overrides, keyed by process name.
+    /// Values are linear scalars in [0.0, 1.0] where 1.0 = full session volume.
+    /// `#[serde(default)]` means old saves without this field load cleanly —
+    /// missing keys default to 1.0 (no volume change) at read time.
+    #[serde(default)]
+    app_volumes: HashMap<String, f32>,
 }
 
 impl ProfileStore {
@@ -174,6 +201,8 @@ impl ProfileStore {
             profiles,
             app_assignments: HashMap::new(),
             default_profile_name: DEFAULT_PROFILE_NAME.to_string(),
+            disabled_apps: HashSet::new(),
+            app_volumes: HashMap::new(),
         }
     }
 
@@ -214,6 +243,51 @@ impl ProfileStore {
         self.app_assignments.retain(|_, assigned| assigned != name);
 
         Ok(profile)
+    }
+
+    /// Renames an existing profile from `old_name` to `new_name`.
+    ///
+    /// All app assignments that pointed to `old_name` are updated automatically,
+    /// and if `old_name` was the default profile the default name is updated too.
+    ///
+    /// Returns `Err(EmptyName)` if `new_name` is blank, `Err(AlreadyExists)` if
+    /// a profile with `new_name` already exists, or `Err(NotFound)` if `old_name`
+    /// doesn't exist.
+    pub fn rename_profile(&mut self, old_name: &str, new_name: &str) -> Result<(), ProfileError> {
+        let new_name = new_name.trim().to_string();
+
+        if new_name.is_empty() {
+            return Err(ProfileError::EmptyName);
+        }
+        if old_name == new_name {
+            return Ok(()); // no-op — nothing to do
+        }
+        if self.profiles.contains_key(&new_name) {
+            return Err(ProfileError::AlreadyExists(new_name));
+        }
+        if !self.profiles.contains_key(old_name) {
+            return Err(ProfileError::NotFound(old_name.to_string()));
+        }
+
+        // Remove the profile under the old key, update its name field,
+        // and re-insert it under the new key.
+        let mut profile = self.profiles.remove(old_name).unwrap();
+        profile.name = new_name.clone();
+        self.profiles.insert(new_name.clone(), profile);
+
+        // Redirect every app assignment that pointed to the old name.
+        for assigned in self.app_assignments.values_mut() {
+            if *assigned == old_name {
+                *assigned = new_name.clone();
+            }
+        }
+
+        // If the renamed profile was the default, keep the default pointer valid.
+        if self.default_profile_name == old_name {
+            self.default_profile_name = new_name;
+        }
+
+        Ok(())
     }
 
     /// Returns a reference to the named profile, or `None` if not found.
@@ -297,15 +371,71 @@ impl ProfileStore {
 
     /// Removes the explicit profile assignment for `app_exe`.
     /// After this call the app reverts to using the default profile.
+    /// Also clears the app's volume override so it returns to full volume.
     /// No-op if the app had no assignment.
     pub fn unassign_app(&mut self, app_exe: &str) {
         self.app_assignments.remove(app_exe);
+        // Clear the disabled flag so if the app is re-added later it starts
+        // enabled rather than inheriting the old disabled state.
+        self.disabled_apps.remove(app_exe);
+        // Clear the volume override — the Tauri layer will reset the WASAPI
+        // session to 1.0 separately.
+        self.app_volumes.remove(app_exe);
+    }
+
+    /// Enables or disables automatic profile switching for `app_exe`.
+    ///
+    /// Disabled apps keep their profile assignment — they will not auto-switch
+    /// when focused, but the profile is immediately re-applied if re-enabled.
+    pub fn set_app_enabled(&mut self, app_exe: &str, enabled: bool) {
+        if enabled {
+            self.disabled_apps.remove(app_exe);
+        } else {
+            self.disabled_apps.insert(app_exe.to_string());
+        }
+    }
+
+    /// Returns true if `app_exe` will trigger automatic profile switching.
+    /// Apps that are not in `app_assignments` always return true (they have
+    /// no assignment to disable, so the question is moot).
+    pub fn is_app_enabled(&self, app_exe: &str) -> bool {
+        !self.disabled_apps.contains(app_exe)
     }
 
     /// Returns a reference to the full app-assignment map.
     /// Useful for serialization and for the UI's "per-app" settings screen.
     pub fn app_assignments(&self) -> &HashMap<String, String> {
         &self.app_assignments
+    }
+
+    /// Returns the set of apps whose auto-switching is currently disabled.
+    pub fn disabled_apps(&self) -> &HashSet<String> {
+        &self.disabled_apps
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-app volume
+    // -------------------------------------------------------------------------
+
+    /// Returns the stored WASAPI session volume for `app_exe`, or 1.0 if none.
+    ///
+    /// 1.0 = full session volume, 0.0 = silent. This is a linear scalar, not dB.
+    pub fn get_app_volume(&self, app_exe: &str) -> f32 {
+        self.app_volumes.get(app_exe).copied().unwrap_or(1.0)
+    }
+
+    /// Stores a WASAPI session volume override for `app_exe`.
+    ///
+    /// Only persists the value — the Tauri command layer is responsible for
+    /// actually calling `set_process_volume` on the live WASAPI session.
+    pub fn set_app_volume(&mut self, app_exe: &str, volume: f32) {
+        self.app_volumes.insert(app_exe.to_string(), volume.clamp(0.0, 1.0));
+    }
+
+    /// Returns the full per-app volume map.
+    /// Used by `get_profiles` so the frontend can restore slider positions.
+    pub fn app_volumes(&self) -> &HashMap<String, f32> {
+        &self.app_volumes
     }
 }
 

@@ -21,18 +21,20 @@
 
 use std::{fs, io, path::Path};
 
-use eq_core::ProfileStore;
+use eq_core::{BandConfig, Profile, ProfileStore};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // AppConfig — persisted user preferences
 // ---------------------------------------------------------------------------
 
+fn default_output_gain() -> f32 { 1.0 }
+
 /// Lightweight user preferences persisted across restarts.
 ///
 /// Kept separate from ProfileStore so config can be saved/loaded independently
 /// without touching the (potentially larger) profile data.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// The WASAPI render endpoint ID the user last selected (real speakers/headphones).
     ///
@@ -47,6 +49,24 @@ pub struct AppConfig {
     /// that apps route their audio to. `None` captures from the system-default output.
     #[serde(default)]
     pub capture_device_id: Option<String>,
+
+    /// Linear output gain applied in the render loop (multiplied with the
+    /// VolumeMonitor scalar). Default 1.0. Range [0.0, 4.0].
+    ///
+    /// Compensates for VB-Cable's inherent lower signal level vs. direct
+    /// device output — the user sets this once and forgets it.
+    #[serde(default = "default_output_gain")]
+    pub output_gain: f32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            last_device_id: None,
+            capture_device_id: None,
+            output_gain: default_output_gain(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +125,55 @@ pub fn load_config(dir: &Path) -> AppConfig {
         return AppConfig::default();
     };
     serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// APO shared state
+//
+// When the active EQ profile changes in the Tauri app, we write a small JSON
+// file to a machine-wide path that the APO DLL (running inside audiodg.exe)
+// can read on its next Initialize or LockForProcess call.
+//
+// %PUBLIC% (C:\Users\Public) is chosen because:
+//   - It is writable by all authenticated users (the Tauri process).
+//   - It is readable by LOCAL SERVICE / SYSTEM (audiodg.exe's identity).
+//   - It persists across sessions (unlike %TEMP%).
+// ---------------------------------------------------------------------------
+
+const APO_STATE_FILE: &str = "active_profile.json";
+
+/// Returns the path where the APO shared state file is written.
+/// Typically `C:\Users\Public\soundEQ\active_profile.json`.
+pub fn apo_config_path() -> std::path::PathBuf {
+    let public = std::env::var("PUBLIC").unwrap_or_else(|_| r"C:\Users\Public".into());
+    std::path::Path::new(&public).join("soundEQ").join(APO_STATE_FILE)
+}
+
+/// JSON written to the APO shared state file.
+/// The sample rate is included so the APO does not need to extract it from
+/// the WAVEFORMATEX descriptor in LockForProcess — it already knows the
+/// correct value from the running WASAPI session.
+#[derive(Serialize)]
+struct ApoStateFile<'a> {
+    name: &'a str,
+    bands: &'a [BandConfig],
+    sample_rate: u32,
+}
+
+/// Writes `profile` and `sample_rate` to the APO shared state file.
+///
+/// Called whenever the active profile changes. The APO reads this on its
+/// next Initialize (DLL load) or LockForProcess (stream restart) call.
+/// Failures are non-fatal — the APO falls back to passthrough silently.
+pub fn save_active_profile(profile: &Profile, sample_rate: u32) -> io::Result<()> {
+    let path = apo_config_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = ApoStateFile { name: &profile.name, bands: &profile.bands, sample_rate };
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    fs::write(&path, json)
 }
 
 // ---------------------------------------------------------------------------

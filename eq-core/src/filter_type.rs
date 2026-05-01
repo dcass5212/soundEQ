@@ -113,6 +113,12 @@ pub struct BandConfig {
     /// Whether this band is active. Disabled bands are skipped in the chain,
     /// which is more efficient than processing a flat filter.
     pub enabled: bool,
+
+    /// Display color for the band on the EQ canvas (hex string, e.g. "#6366f1").
+    /// Purely cosmetic — has no effect on DSP. Omitted from JSON when None so
+    /// older profiles that predate this field deserialize correctly.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub color: Option<String>,
 }
 
 impl BandConfig {
@@ -127,6 +133,7 @@ impl BandConfig {
             gain_db: 0.0,
             q: 1.4,
             enabled: true,
+            color: None,
         }
     }
 
