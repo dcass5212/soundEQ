@@ -1,6 +1,7 @@
 # Rust build output
 target/
 src-tauri/target/
+eq-core/Cargo.lock
 
 # Node / frontend
 node_modules/
@@ -22,12 +23,17 @@ Thumbs.db
 
 # Claude Code internals
 .claude/
+CLAUDE.md
 *.gitignore.txt
+
+# Icon generation scratch files
+Roboto-Bold.ttf
 
 # Personal notes and scratch files
 *.md.bak
 airpod incident.md
-bash.exe.stackdump
+*.stackdump
 test-dll-load.ps1
 add-to-start-menu.vbs
+run.bat
 run.vbs

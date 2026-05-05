@@ -13,8 +13,6 @@
 - **Single-instance guard** — second launch brings the existing window to foreground
 - **Focus-based per-app profile routing** — foreground window polling at 250 ms, app chips glow green when focused
 - **Resizable panels** — EQ canvas, profile sidebar, and apps bar are all user-resizable
-- **APO Phase 1** — COM shell compiles, registers as MFX on all render endpoints, passthrough confirmed
-- **APO Phase 2 (code)** — DSP wired: FilterChain built in LockForProcess, APOProcess applies EQ in-place, reads active_profile.json from %PUBLIC%\soundEQ\
 - **Global hotkey to bypass** — Ctrl+Shift+B toggles EQ bypass system-wide via `RegisterHotKey`; UI button stays in sync via 250 ms polling (Tauri events are unreliable from OS shortcut callback threads)
 - **Tray icon status** — tooltip and context menu status item update dynamically: ○ Stopped / ⊘ Bypassed / ● Active — Profile Name
 - **Output gain control** — Vol −/+ in the header compensates for VB-Cable's lower signal level vs. direct output; 50–200% range, 5% steps, hold-to-repeat after 400 ms, persisted in config.json
@@ -28,38 +26,21 @@
 
 ## Before Shipping (blocking — must be done before distributing to others)
 
-### CA code-signing certificate
-Self-signed certs are rejected by Windows Memory Integrity (HVCI), which is on by default on modern Windows 11 hardware. audiodg.exe will silently refuse to load an unsigned or self-signed APO DLL. **Azure Trusted Signing** (~$3/month) is the recommended path — Microsoft-backed, broadly trusted, pay-per-signature.
+### Code-signing certificate (SmartScreen)
+The Tauri `.exe` and NSIS installer must be signed with a CA-trusted certificate. Without it, Windows SmartScreen shows an "unknown publisher" warning when users run the installer. **Azure Trusted Signing** (~$3/month) is the recommended path — Microsoft-backed, pay-per-signature, works with the Tauri build pipeline.
 
-### APO Phase 2 — confirm DSP works end-to-end
-The code is written but has never actually run inside audiodg.exe (HVCI blocked all test runs). Once signed, verify: the filter chain applies audibly, the correct bands load from active_profile.json, APOProcess is being called (check apo_trace.log), and restarting the audio service doesn't crash audiodg.exe.
-
-### APO Phase 2 — fix sample rate in LockForProcess
-The APO currently reads sample rate from active_profile.json. This is wrong if the negotiated device rate differs (44.1 kHz, 96 kHz, etc.) — the biquad coefficients will be offset and the EQ curve will be incorrect. LockForProcess receives the actual negotiated format via `APO_CONNECTION_DESCRIPTOR`; read the sample rate from there instead of the JSON file.
-
-### APO Phase 3 — live profile reload
-The APO reads active_profile.json once at Initialize time. Changing the EQ curve in the UI has no effect until the audio service is restarted. Phase 3 adds a file watcher (ReadDirectoryChangesW or similar) so profile changes apply immediately without a service restart.
-
-### APO Phase 4 — remove VB-Cable
-Strip the WASAPI loopback capture and render pipeline from eq-audio. Remove VB-Cable detection and the setup banner from the UI. Update the first-run experience to reflect the APO-based architecture. Users should not need VB-Cable installed at all.
-
-### APO Phase 5 — installer
-Ship a proper installer (WiX or NSIS) that:
-- Copies eq_apo.dll to a stable location (e.g. `Program Files\soundEQ\`)
-- Runs APO registration (equivalent of register.ps1) with admin elevation at install time
-- Handles uninstall cleanly — unregisters the COM class and removes FxProperties entries from all endpoints
-- Creates %APPDATA%\soundEQ\ and the %PUBLIC%\soundEQ\ shared directory
-- Adds the Tauri app to Windows startup
-
-### App signing (SmartScreen)
-The Tauri .exe and installer must also be signed with the same CA cert. Without it, Windows SmartScreen shows an "unknown publisher" warning when users run the installer, which is a significant trust barrier for new users.
+### Installer polish
+The NSIS bundle config is in place (`tauri.conf.json`). Before shipping, verify: silent install works, uninstall removes `%APPDATA%\com.soundeq.app\` cleanly, and the Start Menu shortcut is created correctly.
 
 ### Multi-device and compatibility testing
-Test with headphones, USB audio devices, and Bluetooth (Bluetooth APOs have quirks). Verify the APO is registered and active on newly connected devices. Test on a clean Windows 10 machine (not just the dev system).
+Test with headphones, USB audio devices, and Bluetooth. Verify VB-Cable loopback behaves correctly at 44.1 kHz and 48 kHz. Test on a clean Windows 10 machine (not just the dev system).
 
 ---
 
 ## High Priority
+
+### ~~Add a LICENSE file~~ ✅
+MIT license added as `LICENSE` in the project root.
 
 ### AutoEQ headphone correction ⭐
 The [AutoEQ project](https://github.com/jaakkopasanen/AutoEq) has frequency response measurements and correction EQ curves for 2,000+ headphones. Let users pick their headphone model from a searchable list and auto-load the correction profile. The DSP is the same parametric EQ already in eq-core — this is mostly a data pipeline and UI problem. Sonarworks SoundID does this and charges $100+/year; offering it at a fraction of that price is a strong differentiator.
@@ -98,3 +79,27 @@ Encode a profile as a compact base64 URL fragment so users can paste it into a f
 
 ### Configurable startup delay
 The current fixed 10-second delay covers most systems. A user-settable value (0–30 s) in a settings panel would let people on fast machines skip the wait and people on slow machines extend it.
+
+---
+
+## Final Steps Before Release v1.0
+
+### ~~Finalize code and run efficiency tests~~ ✅
+Audit the audio capture and render loops for any unnecessary work per buffer. Profile with a release build under real listening conditions. Verify no regressions in latency or CPU usage since the last major feature additions (crossfeed, spectrum analyzer, per-app volume).
+
+### ~~Review and update .gitignore~~ ✅
+Confirm all build artifacts, dev utilities, downloaded assets, and local scratch files are covered. Remove any entries that no longer apply after the eq-apo removal.
+
+### ~~Documentation review~~ ✅
+Read through README.md, ROADMAP.md, DECISIONS.md, and CHANGELOG.md end-to-end with fresh eyes. Check for stale references, broken formatting, inaccurate feature descriptions, and anything that assumes internal context a new visitor wouldn't have. Verify all installation steps still match the current build output.
+
+### ~~Incorporate icon into documentation and GitHub page~~ ✅ (partial)
+Add the app icon to the README (header or features section), the GitHub repository's social preview image, and any other public-facing materials. Export a high-resolution PNG from `src-tauri/icons/app-icon-source.png` for use in graphics that don't use the `.ico` format.
+
+- ✅ README header updated — icon rendered above the title at 100 px.
+- ⬜ **GitHub social preview** — must be set manually: GitHub repo → **Settings → Social preview → Edit** → upload `src-tauri/icons/app-icon-source.png` (1024×1024). GitHub crops it to the 2:1 social card format automatically.
+
+### ~~Uninstaller cleanup~~ ✅
+The NSIS uninstaller removes the app binary and Start Menu shortcut but leaves `%APPDATA%\com.soundeq.app\` (saved profiles, config) on disk. Users who want a clean uninstall must delete this folder manually. Options:
+- ~~Add an NSIS `[Run]` step to delete the folder after uninstall (with a confirmation prompt so users can choose to keep their profiles)~~ ✅ Done via `NSIS_HOOK_POSTUNINSTALL` in `src-tauri/nsis-hooks.nsh`.
+- Or update the README uninstall instructions to explicitly mention this path alongside the current note

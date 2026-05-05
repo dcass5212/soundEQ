@@ -1,30 +1,51 @@
-# soundEQ
+<p align="center">
+  <img src="src-tauri/icons/app-icon-source.png" width="100" alt="soundEQ">
+</p>
 
-A system-wide parametric equalizer for Windows. Built with Tauri v2 + React
-frontend and Rust backend. Captures all system audio via WASAPI loopback,
-applies real-time DSP filtering, and routes processed audio back to your speakers.
+<h1 align="center">soundEQ</h1>
 
-## Prerequisites
-- Windows 10/11
-- Rust (via rustup.rs)
-- Node.js 18+
-- MSVC Build Tools (Desktop development with C++)
-- Windows 11 SDK
-- **VB-Audio Virtual Cable** — required for audio routing (see Setup below)
+<p align="center">
+  A system-wide parametric equalizer for Windows. Built with Tauri v2 + React
+  frontend and Rust backend. Captures all system audio via WASAPI loopback,
+  applies real-time DSP filtering, and routes processed audio back to your speakers.
+</p>
 
-## Setup (one-time)
+---
 
-soundEQ cannot register itself as a Windows audio device from user-mode code.
-Instead it uses a free virtual audio cable driver to intercept system audio:
+## Installation
 
-1. Search for **VB-Audio Virtual Cable** and install the free driver.
-2. Open **Windows Sound settings** and set **CABLE Input** as your default
-   output device. This redirects all app audio into the virtual cable.
-3. Launch soundEQ. The **Capture** dropdown will auto-select `CABLE Input`.
-4. In the **Output** dropdown, select your real speakers or headphones.
-5. Press **Start** (the engine starts automatically if devices are detected).
+> **Requirements:** Windows 10 or 11 (64-bit). A free copy of
+> [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) is required for audio routing.
 
-Signal path: `Apps → CABLE Input → soundEQ loopback capture → EQ → Speakers`
+1. **Install VB-Audio Virtual Cable** — download the free driver from vb-audio.com
+   and run its installer. It creates the **CABLE Input** and **CABLE Output** virtual
+   audio devices that soundEQ uses to intercept system audio.
+
+2. **Download soundEQ** — grab `soundEQ_x64-setup.exe` from the
+   [Releases](../../releases) page.
+
+3. **Run the installer** — if Windows SmartScreen shows an "unknown publisher"
+   warning, click **More info → Run anyway**. (The app is not yet signed with a CA
+   certificate; a signed release is planned.)
+
+4. **Set CABLE Input as your default output** — open
+   **Windows Settings → System → Sound → Output** and select **CABLE Input**.
+   This redirects all application audio into the virtual cable.
+
+5. **Launch soundEQ** — find it in the Start menu or use the desktop shortcut.
+   It starts minimized to the system tray; left-click the tray icon to open the window.
+
+6. **Pick your real output device** — in the soundEQ **Output** dropdown, select your
+   speakers or headphones. Click **Start**.
+
+Signal path: `Apps → CABLE Input → soundEQ (EQ applied) → Speakers / Headphones`
+
+### Removing soundEQ
+
+Open **Windows Settings → Apps → Installed Apps**, find soundEQ, and uninstall.
+The uninstaller will offer to delete your saved profiles and configuration — choose
+**Yes** for a clean removal or **No** to keep them (useful before reinstalling).
+To remove the data folder manually at any time: `%APPDATA%\com.soundeq.app\`.
 
 ---
 
@@ -105,7 +126,10 @@ the row background) to give that row keyboard focus — a subtle indigo ring app
 |---|---|
 | ↑ / ↓ | Move focus to the row above or below |
 | Shift+↑ / Shift+↓ | Reorder this band one position up or down |
-| Enter | Enter edit mode — focuses the filter-type select |
+| Enter or F2 | Enter edit mode — focuses the filter-type select |
+| Space | Toggle the band's enable/disable state |
+| m | Toggle mute |
+| s | Toggle solo |
 | Delete or Backspace | Delete this band; focus moves to the next row |
 | Escape | Exit edit mode — blurs the focused field, returns focus to the row |
 
@@ -168,6 +192,10 @@ profile when you tab between apps — no manual action needed.
 
 **Removing an app** reverts it to the global default profile.
 
+**Per-app volume** — each app row in the expanded panel has a volume slider (0–100%)
+that adjusts its WASAPI session volume independently of the Windows master volume.
+The setting persists with the app assignment and resets to 100% on removal.
+
 **Enabling/disabling an app** — in the collapsed bar, click an app chip to toggle its
 automatic profile switching on or off without removing the assignment. Disabled apps appear
 dimmed. The currently focused app is highlighted in emerald with an animated dot.
@@ -228,12 +256,27 @@ headphones — has no meaningful effect on speakers.
 
 ---
 
+### Output Gain
+
+The **Vol −/+** control in the header compensates for VB-Cable's inherently lower signal
+level compared to direct device output. The gain multiplies the processed audio in the
+render loop after EQ and volume scaling.
+
+| Range | Step | Hold to repeat |
+|---|---|---|
+| 50 % – 200 % | 5 % | Yes, after 400 ms |
+
+The setting persists across restarts.
+
+---
+
 ### EQ Bypass
 
-Click **⊘ Bypass** in the header to pass audio through completely unmodified while keeping
-the engine running. The EQ curve dims on the canvas and the tray indicator updates to
-`⊘ Bypassed`. Click again to re-enable the active profile. Bypass resets automatically
-when the engine is stopped.
+Click **⊘ Bypass** in the header — or press **Ctrl+Shift+B** anywhere while soundEQ is
+running — to pass audio through completely unmodified while keeping the engine running.
+The EQ curve dims on the canvas and the tray indicator updates to `⊘ Bypassed`. Click
+again (or press the hotkey again) to re-enable the active profile. Bypass resets
+automatically when the engine is stopped.
 
 ---
 
@@ -253,6 +296,14 @@ message explains what happened so you can restart manually.
 
 ## Development
 
+### Prerequisites
+
+- Rust (stable, via [rustup.rs](https://rustup.rs))
+- Node.js 18+
+- MSVC Build Tools — "Desktop development with C++" workload
+- Windows 11 SDK
+- VB-Audio Virtual Cable installed and set as default output (see Installation above)
+
 ```bash
 npm install          # install frontend dependencies (first run only)
 npm run tauri dev    # start Vite dev server + Tauri app together
@@ -269,4 +320,4 @@ Subsequent runs are fast due to incremental compilation.
 - `src/` — React frontend: EQ curve canvas, band controls, profile manager, app panel
 
 ## Architecture
-See CLAUDE.md for full technical details and build decisions.
+See `DECISIONS.md` for the architectural decision log.

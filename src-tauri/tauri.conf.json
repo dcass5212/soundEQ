@@ -1,6 +1,6 @@
 {
   "productName": "soundEQ",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.soundeq.app",
   "build": {
     "frontendDist": "../dist",
@@ -28,7 +28,31 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "SquidGod7",
+    "category": "Music",
+    "shortDescription": "System-wide parametric equalizer for Windows",
+    "longDescription": "soundEQ applies real-time parametric EQ to all Windows audio output via WASAPI loopback. Up to 16 bands per profile, 7 filter types, per-app profile routing, headphone crossfeed, spectrum analyzer, and system tray integration.",
+    "homepage": "https://github.com/SquidGod7/soundEQ",
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "tsp": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "languages": ["English"],
+        "installMode": "currentUser",
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    }
   }
 }

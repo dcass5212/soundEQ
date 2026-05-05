@@ -249,7 +249,7 @@ impl WasapiRenderer {
     pub fn has_crashed(&self) -> bool {
         self.thread_handle
             .as_ref()
-            .map_or(false, |h| h.is_finished())
+            .is_some_and(|h| h.is_finished())
             && !self.stop_flag.load(Ordering::Relaxed)
     }
 }
@@ -317,6 +317,7 @@ fn render_thread_main(
     let _ = unsafe { audio_client.Stop() };
 }
 
+#[allow(clippy::too_many_arguments)] // internal hot-path fn; bundling into a struct adds no value
 fn run_render_loop(
     stop_flag: &AtomicBool,
     ring: &Mutex<SampleBuffer>,
@@ -327,14 +328,21 @@ fn run_render_loop(
     volume: &AtomicU32,
     output_gain: &AtomicU32,
 ) {
+    // GetBufferSize returns the total WASAPI buffer capacity in frames, which
+    // is fixed after Initialize() and never changes. Query it once here so the
+    // hot loop only calls the cheaper GetCurrentPadding() each iteration.
+    //
+    // unsafe: audio_client is valid — guaranteed by render_thread_main calling
+    // IAudioClient::Start() successfully before entering this function.
+    let buf_size = match unsafe { audio_client.GetBufferSize() } {
+        Ok(n) => n,
+        Err(e) => { eprintln!("[eq-audio] GetBufferSize: {e}"); return; }
+    };
+
     while !stop_flag.load(Ordering::Relaxed) {
         thread::sleep(sleep_duration);
 
-        // unsafe: GetBufferSize and GetCurrentPadding are valid on a started client.
-        let buf_size = match unsafe { audio_client.GetBufferSize() } {
-            Ok(n) => n,
-            Err(e) => { eprintln!("[eq-audio] GetBufferSize: {e}"); break; }
-        };
+        // unsafe: GetCurrentPadding is valid on a started client.
         let padding = match unsafe { audio_client.GetCurrentPadding() } {
             Ok(n) => n,
             Err(e) => { eprintln!("[eq-audio] GetCurrentPadding: {e}"); break; }
@@ -517,20 +525,6 @@ unsafe fn parse_render_format(ptr: *const WAVEFORMATEX) -> Result<StreamFormat, 
     }
 
     Ok(StreamFormat { sample_rate: rate, channels })
-}
-
-/// Constructs a plain WAVEFORMATEX describing float32 stereo at `fmt.sample_rate`.
-fn make_render_waveformatex(fmt: &StreamFormat) -> WAVEFORMATEX {
-    let block_align: u16 = fmt.channels * 4;
-    WAVEFORMATEX {
-        wFormatTag:      WAVE_FORMAT_IEEE_FLOAT,
-        nChannels:       fmt.channels,
-        nSamplesPerSec:  fmt.sample_rate,
-        nAvgBytesPerSec: fmt.sample_rate * block_align as u32,
-        nBlockAlign:     block_align,
-        wBitsPerSample:  32,
-        cbSize:          0,
-    }
 }
 
 // ---------------------------------------------------------------------------

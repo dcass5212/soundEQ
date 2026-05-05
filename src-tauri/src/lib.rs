@@ -53,6 +53,10 @@ use persistence::{AppConfig, load_config, load_profiles, save_active_profile, sa
 // injects `State<'_, AppState>` into any command that declares it.
 //
 // `data_dir` is read-only after setup so it does not need a Mutex.
+//
+// Lock ordering: always acquire `store` before `engine`, or acquire one,
+// clone what you need, drop it, then acquire the other. Never hold both
+// simultaneously — doing so in different orders across commands deadlocks.
 // ---------------------------------------------------------------------------
 
 /// Handles needed to update the system tray appearance at runtime.
@@ -537,7 +541,8 @@ fn apply_bypass(enabled: bool, state: &AppState, app: &tauri::AppHandle) {
             state.engine.lock().unwrap().apply_profile(&p);
         }
     }
-    let bypassed = state.engine.lock().unwrap().bypassed;
+    // bypassed == enabled after either branch above; no need for a third lock.
+    let bypassed = enabled;
     // Emit directly to the "main" window rather than broadcasting via app.emit().
     // app.emit() can fail silently when called from non-tokio threads (e.g. the
     // global shortcut OS callback thread); window.emit() uses a direct channel
@@ -1095,6 +1100,14 @@ pub fn run() {
             });
 
             if let Some(win) = app.get_webview_window("main") {
+                // Push the app icon onto the window so Task Manager, Alt+Tab,
+                // and the taskbar button all show the correct icon. WebView2
+                // does not inherit the exe's embedded resource icon automatically,
+                // so without this call Windows shows a blank placeholder.
+                if let Some(icon) = app.default_window_icon() {
+                    let _ = win.set_icon(icon.clone());
+                }
+
                 // Show the window on a normal (non-startup) launch.
                 if !start_hidden {
                     win.show()?;

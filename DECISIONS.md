@@ -32,10 +32,13 @@ unpredictable latency spikes. All audio thread data structures are
 pre-allocated and stack-based. FilterChain uses a fixed [FilterBand; 16]
 array for this reason.
 
-## ADR-007: Spectrum analyzer deferred
+## ADR-007: Spectrum analyzer deferred to Phase 2, then shipped
 Adds significant complexity (FFT, ring buffer, thread-safe visualization
-pipeline). Core EQ functionality ships first; spectrum analyzer added in
-Phase 2 once the audio pipeline is proven stable.
+pipeline). Core EQ functionality shipped first; spectrum analyzer implemented
+in Phase 2 (`eq-audio/src/spectrum.rs`) once the audio pipeline was proven
+stable. Uses a 2048-sample Hann-windowed FFT mapped to 80 log-spaced bands
+(20 Hz – 20 kHz) with fast-attack/slow-release smoothing. Allocation-free
+hot path — all buffers pre-allocated at construction.
 
 ## ADR-008: Virtual audio cable (VB-Audio) over a custom kernel driver
 Windows only exposes audio endpoints to apps that ship a signed kernel-mode

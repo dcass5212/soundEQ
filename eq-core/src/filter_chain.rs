@@ -100,8 +100,8 @@ impl FilterChain {
     /// half-updated state.
     pub fn set_bands(&mut self, bands: &[BandConfig]) {
         let count = bands.len().min(MAX_BANDS);
-        for i in 0..count {
-            let coeffs = Coefficients::from_band(&bands[i], self.sample_rate);
+        for (i, band) in bands.iter().enumerate().take(count) {
+            let coeffs = Coefficients::from_band(band, self.sample_rate);
             self.bands[i].update(coeffs);
         }
         // Reset any slots that are no longer used (edge case: user deleted bands)
@@ -115,6 +115,7 @@ impl FilterChain {
     /// Called when the user tweaks a knob in real time.
     /// This is the hot path for live editing — must be fast.
     pub fn update_band(&mut self, index: usize, band: &BandConfig) {
+        debug_assert!(index < MAX_BANDS, "update_band: index {index} out of range (MAX_BANDS={MAX_BANDS})");
         if index >= MAX_BANDS {
             return; // silent guard — index validated on the frontend
         }

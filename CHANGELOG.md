@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Icon added to README header** — `src-tauri/icons/app-icon-source.png` (1024×1024) rendered at 100 px above the title using centered HTML. GitHub social preview must be set manually via repo Settings → Social preview.
+  - `README.md`
+- **Documentation review** — audited README.md, DECISIONS.md, and CHANGELOG.md for stale content. Fixed: uninstall instructions now describe the installer prompt (added this session) instead of saying "delete manually"; keyboard navigation table was missing `F2`, `Space`, `m`, `s`; no mention of `Ctrl+Shift+B` bypass hotkey, output gain control, or per-app volume slider. Added sections for Output Gain and updated EQ Bypass with the hotkey. Updated ADR-007 to reflect the spectrum analyzer shipped in Phase 2. Fixed duplicate `### Changed` headers and missing blank line in CHANGELOG.
+  - `README.md`, `DECISIONS.md`, `CHANGELOG.md`
+- **Uninstaller left `%APPDATA%\com.soundeq.app` on disk** — added `NSIS_HOOK_POSTUNINSTALL` in `src-tauri/nsis-hooks.nsh`. After removing the binary and shortcuts, the uninstaller now checks for the data directory and offers a Yes/No prompt: Yes deletes it (clean uninstall), No preserves it (useful before reinstalling). The dialog is skipped entirely if the directory doesn't exist.
+  - `src-tauri/nsis-hooks.nsh`, `src-tauri/tauri.conf.json`
+- **App icon missing from Task Manager / Alt+Tab / taskbar** — WebView2 does not inherit the executable's embedded resource icon automatically. Added an explicit `win.set_icon(app.default_window_icon())` call in the setup handler so the icon is pushed to the window on every launch.
+  - `src-tauri/src/lib.rs`
+- **`GetBufferSize` called once per render cycle instead of per loop** — `IAudioClient::GetBufferSize()` returns a constant value fixed at `Initialize()` time, but was being called on every render-loop iteration (~200×/second). Moved the call before the loop; only `GetCurrentPadding()` (which changes each cycle) remains inside.
+  - `eq-audio/src/render.rs`
+- **Stale hardware test signatures** — two `#[ignore]` capture tests called `LoopbackCapture::start()` with the pre-crossfeed 3-argument signature, causing compile errors when running the test suite. Updated to pass a `CrossfeedProcessor` as the third argument.
+  - `eq-audio/src/capture.rs`
+
+### Changed
+- **Version bumped to 1.0.0** — updated across all manifests: `eq-core/Cargo.toml`, `eq-audio/Cargo.toml`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `package.json`.
+- **GitHub Actions CI added** — `.github/workflows/ci.yml` runs `cargo check`, `cargo clippy -- -D warnings`, `cargo test`, and `npm run build` on every push and PR to master using `windows-latest`.
+  - `.github/workflows/ci.yml`
+- **Clippy clean** — resolved all `clippy::needless_range_loop`, `clippy::unnecessary_map_or`, `clippy::io_other_error`, and `clippy::redundant_closure` warnings across `eq-core`, `eq-audio`, and `src-tauri`. Zero warnings with `-D warnings`.
+  - `eq-core/src/filter_chain.rs`, `eq-audio/src/capture.rs`, `eq-audio/src/render.rs`, `src-tauri/src/engine.rs`, `src-tauri/src/persistence.rs`
+- **`.gitignore` tightened** — generalized `bash.exe.stackdump` to `*.stackdump` to cover any shell crash dump; added `eq-core/Cargo.lock` (spurious workspace-member lock file that should not be tracked).
+  - `.gitignore`
+- **Dead code removed from audio layer** — `make_render_waveformatex` in `render.rs` was defined but never called (not even in tests); removed. `make_waveformatex` in `capture.rs` is test-only; marked `#[cfg(test)]` to eliminate the dead_code lint.
+  - `eq-audio/src/render.rs`, `eq-audio/src/capture.rs`
+- **Removed eq-apo from repo** — APO edition moved to its own separate repository; `eq-apo/` directory deleted, `Cargo.toml` workspace members updated, `CLAUDE.md` stripped of APO plan sections.
+  - `Cargo.toml`, `CLAUDE.md`
+
+### Fixed
+- **Audio-thread allocation guard** — `processing_buf` in the capture loop was pre-allocated at 4096 samples but could silently reallocate if a WASAPI packet exceeded that size (e.g. 192 kHz exclusive mode). Increased capacity to 8192 and added an explicit guard that logs and skips oversized packets rather than reallocating on the audio thread.
+  - `eq-audio/src/capture.rs`
+- **`handleSetVolume` missing rollback** — the per-app volume slider applied an optimistic store update before the IPC call; on failure the error was shown but the UI remained at the wrong value. Now calls `refreshStore()` in the catch block to restore the true value, matching the pattern already used by `handleCrossfeedChange`.
+  - `src/App.tsx`
+
+### Changed
+- **`apply_bypass` redundant engine lock removed** — the function previously locked the engine a third time just to read `bypassed` after already setting it; `bypassed` is simply `enabled` after either branch, so the extra lock/unlock is dropped.
+  - `src-tauri/src/lib.rs`
+- **Mute/solo IPC errors now log a warning** — previously `.catch(() => {})` silently swallowed `applyBandsLive` failures in the mute and solo handlers. Failures now emit `console.warn` so they are visible in dev tools without being user-facing (mute/solo is transient, so no rollback is needed).
+  - `src/App.tsx`
+- **`update_band` out-of-range guard now asserts in debug builds** — the silent early-return on `index >= MAX_BANDS` is kept for production safety, but a `debug_assert!` is added so the condition is caught loudly during development and testing.
+  - `eq-core/src/filter_chain.rs`
+- **Lock ordering documented in lib.rs** — the global lock hierarchy (`store` before `engine`, never held simultaneously) is now stated once in the "App state" section comment, not only in per-function comments.
+  - `src-tauri/src/lib.rs`
+
+### Added
+- **Distribution prep** — added end-user Installation section to README (covers VB-Cable setup, SmartScreen warning note, uninstall steps); moved dev prerequisites into the Development section. Configured `tauri.conf.json` with Windows NSIS bundle metadata (publisher, category, descriptions, homepage, signing placeholder, `installMode: currentUser`). Added LICENSE file as High Priority item in ROADMAP.
+  - `README.md`, `src-tauri/tauri.conf.json`, `ROADMAP.md`
+
 ### Added
 - **Tray icon state indicator** — the system tray icon now changes colour to reflect the current engine state: gray circle when stopped, amber when bypassed, green when active. Icons are rendered from raw RGBA at runtime (32×32, anti-aliased circle, no extra asset files). The change fires in sync with the existing tooltip and status menu item updates via `update_tray_status`.
   - `src-tauri/src/lib.rs` — `make_state_icon(r, g, b)` helper; `update_tray_status` now calls `handle.tray.set_icon(Some(icon))`
@@ -66,25 +113,8 @@
   - `src-tauri/src/engine.rs` — added `vol_monitor: VolumeMonitor` field; started in `start()` using `renderer.volume_handle()`; stopped first in `stop()`
 
 ### Added
-- **ROADMAP.md — shipping checklist and future features** — documented all remaining work before public release (CA cert, Phase 2 confirmation, Phase 3 live reload, Phase 4 VB-Cable removal, Phase 5 installer, app signing, multi-device testing, APO sample-rate fix) and added a full post-launch feature backlog covering AutoEQ headphone correction, per-device automatic profiles, loudness normalization, REW room correction import, dynamic EQ, mid-side processing, crossfeed, and MIDI controller support.
-  - `ROADMAP.md` — full rewrite: Completed section updated; new Before Shipping section; High/Medium/Lower Priority updated with new items
-
-### Added
-- **eq-apo Phase 2 — DSP wiring** — `APOProcess` now applies the active EQ profile in real-time using `eq_core::FilterChain`. The Tauri app writes the active profile + sample rate to `%PUBLIC%\soundEQ\active_profile.json` whenever the profile changes (`set_active_profile`, `apply_app_profile`, `focus_tick`). The APO reads this in `Initialize` (bands + sample rate → `pending_bands`), builds a `FilterChain` in `LockForProcess`, then calls `process_interleaved()` per buffer in `APOProcess` with `try_lock()` (never blocks the RT thread). Falls back to passthrough if the file is absent. `register.ps1` updated: privilege escalation (`SeTakeOwnershipPrivilege`) to write to SYSTEM-owned `FxProperties` keys; device friendly name lookup fixed for modern Windows.
-  - `eq-apo/Cargo.toml` — added `serde 1.0 (derive)`, `serde_json 1.0`
-  - `eq-apo/src/apo.rs` — `ApoStateFile` deserialization; `read_apo_config()`; `ApoState` gains `filter_chain: FilterChain`, `pending_bands: Vec<BandConfig>`; `Initialize` reads file; `LockForProcess` builds chain; `APOProcess` processes audio with `try_lock()`
-  - `eq-apo/register.ps1` — `WinPrivilege` P/Invoke; `Grant-AdminWrite` function; device name via PKEY `{a45c254e...},2`; regex fix for `Microsoft.PowerShell.Core\Registry::` prefix
-  - `src-tauri/src/persistence.rs` — added `apo_config_path()`, `save_active_profile(profile, sample_rate)` (writes `%PUBLIC%\soundEQ\active_profile.json`)
-  - `src-tauri/src/lib.rs` — added `persist_active_profile()` helper; calls in `set_active_profile`, `apply_app_profile`, `focus_tick`
-
-### Added
-- **eq-apo Phase 1 — COM shell DLL** — created the `eq-apo/` Rust crate that compiles to `eq_apo.dll`, a Windows Audio Processing Object (APO). Phase 1 is a fully passthrough COM shell: the DLL exports `DllGetClassObject` / `DllCanUnloadNow`, implements `IClassFactory` (via `ApoFactory`) and five required APO COM interfaces (`IAudioProcessingObject`, `IAudioProcessingObjectConfiguration`, `IAudioProcessingObjectRT`, `IAudioSystemEffects`, `IAudioSystemEffects2`) as stubs on `SoundEqApo`. When registered as an MFX (Mode Effects) APO it sits after endpoint volume in `audiodg.exe`, which means system volume will work correctly once Phase 2 wires in DSP. `register.ps1` handles COM class registration and endpoint installation; run it as Administrator then restart Windows Audio. CLSID: `{8C2A5F3E-B47D-4A1C-9E8F-D0C3B6A2E1F4}`.
-  - `Cargo.toml` (workspace) — added `eq-apo` member
-  - `eq-apo/Cargo.toml` — `cdylib` crate; `windows 0.58` with `implement` + `Win32_Media_Audio_Apo` features; `windows-core 0.58` direct dep (required by `#[implement]` macro expansion)
-  - `eq-apo/src/lib.rs` — CLSID constant; `OBJECTS_ALIVE` global counter; `DllGetClassObject` / `DllCanUnloadNow` exports
-  - `eq-apo/src/factory.rs` — `ApoFactory` implementing `IClassFactory`
-  - `eq-apo/src/apo.rs` — `SoundEqApo` implementing all five APO COM interfaces as passthrough stubs
-  - `eq-apo/register.ps1` — PowerShell script to register COM class and install on all render endpoints; supports `-Unregister` flag
+- **ROADMAP.md** — added shipping checklist and future feature backlog.
+  - `ROADMAP.md`
 
 ### Added
 - **Profile sidebar polish** — text no longer shrinks when the panel is dragged slightly narrower; shrinking only begins below 160 px (previously started from the very first pixel dragged). Rename (✎) and delete (×) buttons are larger: pencil is now `max(12px, fontSize)` instead of `fontSize − 2`, and × is `max(16px, fontSize + 2)` with wider click padding.

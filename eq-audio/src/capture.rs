@@ -186,7 +186,7 @@ impl LoopbackCapture {
     pub fn has_crashed(&self) -> bool {
         self.thread_handle
             .as_ref()
-            .map_or(false, |h| h.is_finished())
+            .is_some_and(|h| h.is_finished())
             && !self.stop_flag.load(Ordering::Relaxed)
     }
 }
@@ -263,9 +263,9 @@ fn capture_thread_main(
     }
 
     // Pre-allocate the processing buffer once so the hot loop never allocates.
-    // Capacity of 4096 f32 samples covers most WASAPI buffer sizes
-    // (typical WASAPI shared-mode buffer ≈ 480 frames × 2 channels = 960 samples).
-    let mut processing_buf: Vec<f32> = Vec::with_capacity(4096);
+    // 8192 stereo f32 samples covers 192 kHz × 2 ch × ~21 ms — larger than any
+    // WASAPI shared-mode or exclusive-mode buffer we expect in practice.
+    let mut processing_buf: Vec<f32> = Vec::with_capacity(8192);
 
     run_capture_loop(
         &stop_flag,
@@ -344,37 +344,50 @@ fn run_capture_loop(
                     slice::from_raw_parts(data_ptr as *const f32, n_samples)
                 };
 
-                // Copy into the pre-allocated processing buffer.
-                // For stereo: copy the whole slice directly.
-                // For multi-channel (5.1, 7.1, etc.): extract only channels 0 (L)
-                // and 1 (R) from each frame — the FilterChain always works in stereo.
-                processing_buf.clear();
-                if format.channels == 2 {
-                    processing_buf.extend_from_slice(samples);
+                // The output is always stereo regardless of source channel count.
+                let stereo_samples = num_frames as usize * 2;
+
+                // Guard: skip packets that exceed our pre-allocated capacity rather
+                // than letting Vec reallocate on the audio thread. At 192 kHz × 2 ch
+                // a 21 ms period = 8064 samples — well within our 8192 limit.
+                if stereo_samples > processing_buf.capacity() {
+                    eprintln!(
+                        "[eq-audio] oversized packet ({stereo_samples} stereo samples > {} capacity), skipping",
+                        processing_buf.capacity()
+                    );
                 } else {
-                    let ch = format.channels as usize;
-                    for frame in samples.chunks_exact(ch) {
-                        processing_buf.push(frame[0]); // L
-                        processing_buf.push(frame[1]); // R
+                    // Copy into the pre-allocated processing buffer.
+                    // For stereo: copy the whole slice directly.
+                    // For multi-channel (5.1, 7.1, etc.): extract only channels 0 (L)
+                    // and 1 (R) from each frame — the FilterChain always works in stereo.
+                    processing_buf.clear();
+                    if format.channels == 2 {
+                        processing_buf.extend_from_slice(samples);
+                    } else {
+                        let ch = format.channels as usize;
+                        for frame in samples.chunks_exact(ch) {
+                            processing_buf.push(frame[0]); // L
+                            processing_buf.push(frame[1]); // R
+                        }
                     }
-                }
 
-                // Apply the EQ. Lock is acquired and released per packet, so
-                // the control thread can update bands between packets.
-                {
-                    let mut chain = filter_chain.lock().unwrap();
-                    chain.process_interleaved(processing_buf);
-                }
+                    // Apply the EQ. Lock is acquired and released per packet, so
+                    // the control thread can update bands between packets.
+                    {
+                        let mut chain = filter_chain.lock().unwrap();
+                        chain.process_interleaved(processing_buf);
+                    }
 
-                // Apply crossfeed after the EQ chain so the EQ shapes the
-                // signal first and crossfeed then naturalises the stereo image.
-                // No-op when crossfeed is disabled (immediate return in processor).
-                {
-                    let mut cf = crossfeed.lock().unwrap();
-                    cf.process_interleaved(processing_buf);
-                }
+                    // Apply crossfeed after the EQ chain so the EQ shapes the
+                    // signal first and crossfeed then naturalises the stereo image.
+                    // No-op when crossfeed is disabled (immediate return in processor).
+                    {
+                        let mut cf = crossfeed.lock().unwrap();
+                        cf.process_interleaved(processing_buf);
+                    }
 
-                on_processed(processing_buf);
+                    on_processed(processing_buf);
+                }
             }
 
             // unsafe: num_frames must match the value from GetBuffer.
@@ -527,6 +540,7 @@ unsafe fn parse_format(ptr: *const WAVEFORMATEX) -> Result<StreamFormat, AudioEr
 /// Used when calling `IAudioClient::Initialize` — we pass back a format
 /// consistent with what GetMixFormat told us, which guarantees the Initialize
 /// call accepts it in shared mode.
+#[cfg(test)]
 fn make_waveformatex(fmt: &StreamFormat) -> WAVEFORMATEX {
     // In shared mode, WASAPI accepts the exact format returned by GetMixFormat.
     // block_align = channels × (bits_per_sample / 8) = 2 × 4 = 8 bytes per frame.
@@ -636,7 +650,7 @@ mod tests {
         // This test verifies the full WASAPI setup path compiles and runs
         // without errors on a real Windows machine with audio.
         use std::sync::{Arc, Mutex};
-        use eq_core::FilterChain;
+        use eq_core::{CrossfeedProcessor, FilterChain};
 
         let mut capture = LoopbackCapture::new();
         assert!(!capture.is_running());
@@ -644,8 +658,9 @@ mod tests {
         // Start with a flat (passthrough) chain — any sample rate works here
         // because start() updates the chain's sample rate before capturing.
         let chain = Arc::new(Mutex::new(FilterChain::new(48_000.0)));
+        let crossfeed = Arc::new(Mutex::new(CrossfeedProcessor::new()));
         let format = capture
-            .start(None, chain, |_buf| { /* discard processed audio */ })
+            .start(None, chain, crossfeed, |_buf| { /* discard processed audio */ })
             .expect("failed to open loopback device");
 
         assert!(format.sample_rate > 0);
@@ -664,7 +679,7 @@ mod tests {
     fn processed_samples_stay_in_valid_range() {
         // Verifies that the clamp logic in FilterChain is respected end-to-end.
         use std::sync::{Arc, Mutex};
-        use eq_core::{FilterChain, FilterType, BandConfig};
+        use eq_core::{BandConfig, CrossfeedProcessor, FilterChain, FilterType};
 
         let mut bad_band = BandConfig::new(FilterType::Peak, 1000.0);
         bad_band.gain_db = 24.0; // maximum gain — most likely to overflow
@@ -673,13 +688,14 @@ mod tests {
         let mut chain = FilterChain::new(48_000.0);
         chain.set_bands(&[bad_band]);
         let chain = Arc::new(Mutex::new(chain));
+        let crossfeed = Arc::new(Mutex::new(CrossfeedProcessor::new()));
 
         let all_in_range = Arc::new(AtomicBool::new(true));
         let flag_clone = Arc::clone(&all_in_range);
 
         let mut capture = LoopbackCapture::new();
         capture
-            .start(None, chain, move |buf| {
+            .start(None, chain, crossfeed, move |buf| {
                 for &s in buf {
                     if s < -1.0 || s > 1.0 {
                         flag_clone.store(false, Ordering::Relaxed);

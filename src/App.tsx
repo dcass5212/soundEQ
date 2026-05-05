@@ -677,7 +677,7 @@ export default function App() {
 
     const effective = computeEffective(bands, next, soloedBand);
     if (next.size > 0 || soloedBand !== null) {
-      applyBandsLive(effective).catch(() => {});
+      applyBandsLive(effective).catch((e) => console.warn('[soundEQ] applyBandsLive failed:', e));
     } else {
       // All mutes cleared and no solo — restore the stored profile.
       if (running) setActiveProfile(activeName).catch(() => {});
@@ -691,7 +691,7 @@ export default function App() {
 
     const effective = computeEffective(bands, mutedBands, newSolo);
     if (newSolo !== null || mutedBands.size > 0) {
-      applyBandsLive(effective).catch(() => {});
+      applyBandsLive(effective).catch((e) => console.warn('[soundEQ] applyBandsLive failed:', e));
     } else {
       // Solo cleared and no mutes — restore the stored profile.
       if (running) setActiveProfile(activeName).catch(() => {});
@@ -836,6 +836,7 @@ export default function App() {
       await setAppVolume(processName, volume);
     } catch (e) {
       showError(String(e));
+      await refreshStore(); // roll back the optimistic update
     }
   }
 

@@ -177,8 +177,8 @@ impl AudioEngine {
     /// The device-watch background thread calls this every 2 seconds while the
     /// engine is running. On true, it stops and restarts the engine automatically.
     pub fn has_audio_thread_crashed(&self) -> bool {
-        self.capture.as_ref().map_or(false,  |c| c.has_crashed())
-            || self.renderer.as_ref().map_or(false, |r| r.has_crashed())
+        self.capture.as_ref().is_some_and(|c| c.has_crashed())
+            || self.renderer.as_ref().is_some_and(|r| r.has_crashed())
     }
 
     pub fn is_running(&self) -> bool {

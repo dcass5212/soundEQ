@@ -87,7 +87,7 @@ const CONFIG_FILE: &str = "config.json";
 pub fn save_profiles(dir: &Path, store: &ProfileStore) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(store)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     fs::write(dir.join(PROFILES_FILE), json)
 }
 
@@ -113,7 +113,7 @@ pub fn load_profiles(dir: &Path) -> ProfileStore {
 pub fn save_config(dir: &Path, config: &AppConfig) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     fs::write(dir.join(CONFIG_FILE), json)
 }
 
@@ -172,7 +172,7 @@ pub fn save_active_profile(profile: &Profile, sample_rate: u32) -> io::Result<()
     }
     let file = ApoStateFile { name: &profile.name, bands: &profile.bands, sample_rate };
     let json = serde_json::to_string_pretty(&file)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     fs::write(&path, json)
 }
 

@@ -887,19 +887,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "eq-apo"
-version = "0.1.0"
-dependencies = [
- "eq-core",
- "serde",
- "serde_json",
- "windows 0.58.0",
- "windows-core 0.58.0",
-]
-
-[[package]]
 name = "eq-audio"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eq-core",
  "rustfft",
@@ -910,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "eq-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "approx",
  "serde",
@@ -3473,7 +3462,7 @@ dependencies = [
 
 [[package]]
 name = "soundeq"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eq-audio",
  "eq-core",
