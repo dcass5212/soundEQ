@@ -10,6 +10,15 @@
   applies real-time DSP filtering, and routes processed audio back to your speakers.
 </p>
 
+<p align="center">
+  <a href="https://github.com/dcass5212/soundEQ/actions/workflows/ci.yml">
+    <img src="https://github.com/dcass5212/soundEQ/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+</p>
+
+![soundEQ main window](docs/screenshot-main.png)
+![soundEQ system tray](docs/screenshot-tray.png)
+
 ---
 
 ## Installation
