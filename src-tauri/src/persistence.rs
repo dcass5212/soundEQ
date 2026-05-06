@@ -199,7 +199,7 @@ mod tests {
         let config = AppConfig {
             last_device_id: Some("WASAPI-{abc-123}".into()),
             capture_device_id: None,
-            output_gain: 100,
+            output_gain: 1.0,
         };
         save_config(&dir, &config).unwrap();
         let loaded = load_config(&dir);
