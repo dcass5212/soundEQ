@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.0] - 2026-05-05
 
 ### Fixed
 - **Icon added to README header** — `src-tauri/icons/app-icon-source.png` (1024×1024) rendered at 100 px above the title using centered HTML. GitHub social preview must be set manually via repo Settings → Social preview.
