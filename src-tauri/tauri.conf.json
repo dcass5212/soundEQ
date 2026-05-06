@@ -36,7 +36,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "publisher": "SquidGod7",
+    "publisher": "soundEQ",
     "category": "Music",
     "shortDescription": "System-wide parametric equalizer for Windows",
     "longDescription": "soundEQ applies real-time parametric EQ to all Windows audio output via WASAPI loopback. Up to 16 bands per profile, 7 filter types, per-app profile routing, headphone crossfeed, spectrum analyzer, and system tray integration.",
