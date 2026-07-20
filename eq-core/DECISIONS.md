@@ -32,7 +32,8 @@ unpredictable latency spikes. All audio thread data structures are
 pre-allocated and stack-based. FilterChain uses a fixed [FilterBand; 16]
 array for this reason.
 
-## ADR-007: Spectrum analyzer deferred
-Adds significant complexity (FFT, ring buffer, thread-safe visualization
-pipeline). Core EQ functionality ships first; spectrum analyzer added in
-Phase 2 once the audio pipeline is proven stable.
+## ADR-007: Spectrum analyzer deferred to Phase 2
+The feature adds significant complexity (FFT, ring buffer, thread-safe
+visualization pipeline). Core EQ functionality shipped first; the spectrum
+analyzer was added in Phase 2 once the audio pipeline was proven stable.
+Ships as of v1.0.0 (`eq-audio/src/spectrum.rs`).

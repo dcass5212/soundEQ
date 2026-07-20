@@ -11,7 +11,7 @@
 - **Band solo / mute** — M button mutes a band live (non-destructive), S button solos it (silences all others); resets on profile switch
 - **Profile rename** — pencil icon inline edit in the sidebar
 - **Single-instance guard** — second launch brings the existing window to foreground
-- **Focus-based per-app profile routing** — foreground window polling at 250 ms, app chips glow green when focused
+- **Focus-based per-app profile routing** — foreground window polling at 500 ms, app chips glow green when focused
 - **Resizable panels** — EQ canvas, profile sidebar, and apps bar are all user-resizable
 - **Global hotkey to bypass** — Ctrl+Shift+B toggles EQ bypass system-wide via `RegisterHotKey`; UI button stays in sync via 250 ms polling (Tauri events are unreliable from OS shortcut callback threads)
 - **Tray icon status** — tooltip and context menu status item update dynamically: ○ Stopped / ⊘ Bypassed / ● Active — Profile Name

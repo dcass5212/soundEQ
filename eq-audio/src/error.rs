@@ -32,6 +32,19 @@ pub enum AudioError {
     #[error("unsupported channel count: {count} (only stereo / 2-channel is supported)")]
     UnsupportedChannelCount { count: u16 },
 
+    /// The capture and render devices are running at different sample rates.
+    /// The pipeline copies samples straight from capture to render with no
+    /// resampler, so mismatched rates would play audio at the wrong pitch
+    /// and glitch constantly as the two sides drift apart.
+    ///
+    /// Fix: set both devices to the same rate — Sound Control Panel →
+    /// (device) → Properties → Advanced → default format.
+    #[error(
+        "sample rate mismatch: capture device is {capture} Hz but output device is {render} Hz — \
+         set both to the same rate in Windows Sound settings (device Properties → Advanced)"
+    )]
+    SampleRateMismatch { capture: u32, render: u32 },
+
     /// The capture thread failed to start (OS-level thread creation failure).
     #[error("capture thread could not be started: {0}")]
     ThreadSpawn(#[from] std::io::Error),

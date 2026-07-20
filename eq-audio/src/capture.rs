@@ -52,6 +52,7 @@ use windows::Win32::System::Com::{
 use eq_core::{CrossfeedProcessor, FilterChain};
 
 use crate::error::AudioError;
+use crate::rt_priority::RealTimeBoost;
 
 // ---------------------------------------------------------------------------
 // WAVE_FORMAT_* tag constants (from the Windows Multimedia SDK)
@@ -230,6 +231,13 @@ fn capture_thread_main(
         Ok(g) => g,
         Err(e) => { let _ = format_tx.send(Err(e)); return; }
     };
+
+    // Boost this thread into the MMCSS "Pro Audio" scheduling class and raise
+    // the system timer to 1 ms resolution. Without this, heavy CPU load from
+    // other programs preempts us long enough to overflow the WASAPI capture
+    // buffer, which drops audio data and is audible as crackle/static.
+    // The guard reverts both boosts when the thread exits.
+    let _boost = RealTimeBoost::enable("capture");
 
     // Open the loopback device and query its mix format.
     let (audio_client, capture_client, format) = match open_loopback(capture_device_id.as_deref()) {
@@ -461,11 +469,19 @@ fn open_loopback(capture_device_id: Option<&str>) -> Result<(IAudioClient, IAudi
     // channel mask for the extended format.
     //
     // AUDCLNT_STREAMFLAGS_LOOPBACK: read the already-mixed render stream.
+    //
+    // Buffer duration: 200 ms (in 100-nanosecond units) instead of the device
+    // minimum (~20 ms). A capture buffer is a holding area Windows fills for
+    // us — a bigger one does NOT add latency, because we drain it as fast as
+    // packets arrive; it only adds slack. With 200 ms of slack, our thread can
+    // be starved by a CPU spike for far longer before Windows runs out of room
+    // and starts dropping loopback data (which is audible as static).
+    const CAPTURE_BUFFER_DURATION_HNS: i64 = 200 * 10_000; // 200 ms in 100-ns units
     let init_result = unsafe {
         audio_client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
-            0,    // buffer duration: use device minimum
+            CAPTURE_BUFFER_DURATION_HNS,
             0,    // periodicity: must be 0 in shared mode
             fmt_ptr as *const WAVEFORMATEX,
             None, // audio session GUID: use default session

@@ -25,6 +25,9 @@ pub mod session;
 pub mod spectrum;
 pub mod volume;
 
+// Internal: MMCSS + timer-resolution boost used by the capture/render threads.
+mod rt_priority;
+
 pub use error::AudioError;
 pub use capture::{LoopbackCapture, StreamFormat};
 pub use render::{WasapiRenderer, RenderSender};

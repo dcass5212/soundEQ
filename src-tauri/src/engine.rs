@@ -99,7 +99,7 @@ impl AudioEngine {
         // Start the renderer first so the sender is ready for the capture callback.
         let mut renderer = WasapiRenderer::new();
         let sender = renderer.sender();
-        renderer.start(render_device_id)?;
+        let render_fmt = renderer.start(render_device_id)?;
 
         // Start the volume monitor against the capture device (VB-Cable).
         // VolumeMonitor::start() is idempotent if already running; stop() is
@@ -138,6 +138,26 @@ impl AudioEngine {
                 }
             }
         })?;
+
+        // Samples flow from capture to render with no resampler in between,
+        // so both devices must run at the same rate. Channel counts MAY
+        // differ (capture downmixes to stereo, render expands to N channels),
+        // but a rate mismatch would mean wrong pitch plus constant drift
+        // glitches — refuse to start and tell the user how to fix it.
+        // The capture rate is only knowable after capture.start(), so this
+        // check has to happen here; unwind everything started so far.
+        if fmt.sample_rate != render_fmt.sample_rate {
+            capture.stop();
+            renderer.stop();
+            self.vol_monitor.stop();
+            self.started_capture_device = None;
+            self.started_render_device  = None;
+            self.output_gain_arc = None;
+            return Err(AudioError::SampleRateMismatch {
+                capture: fmt.sample_rate,
+                render:  render_fmt.sample_rate,
+            });
+        }
 
         // Now that start() returned we have the real sample_rate.
         // Create the SpectrumAnalyzer with the correct rate and install it.

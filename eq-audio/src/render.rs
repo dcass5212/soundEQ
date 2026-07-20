@@ -31,6 +31,25 @@
 // the remaining render buffer with zeros (silence). This produces a brief
 // quiet gap rather than a harsh click or crash. In practice, with 200 ms of
 // pre-allocated buffer this should be inaudible.
+//
+// PACING (EVENT-DRIVEN):
+// The render loop does not sleep-and-poll. WASAPI is initialised with
+// AUDCLNT_STREAMFLAGS_EVENTCALLBACK and given an event handle; the Windows
+// audio engine signals that event exactly once per device period, when
+// buffer space becomes available. WaitForSingleObject on the event wakes the
+// thread at precisely the right moment — tighter timing than a sleep, no
+// dependency on system timer resolution, and zero CPU while idle.
+//
+// LATENCY CONTROL (DRIFT TRIM):
+// The capture device and the render device run on independent clocks. Even
+// at the same nominal sample rate they drift by a few parts per million,
+// so over minutes the ring backlog slowly grows (capture faster) or drains
+// (render faster). Left alone, a growing backlog means audio latency creeps
+// up toward the full ring capacity before samples are dropped mid-stream.
+// The render loop therefore trims the backlog back to a small target
+// whenever it exceeds a threshold, and masks the resulting waveform
+// discontinuity with a short fade-in. Result: latency stays bounded to tens
+// of milliseconds and the rare trim is inaudible instead of a click.
 // =============================================================================
 
 use std::collections::VecDeque;
@@ -40,12 +59,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
     IAudioClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX, eConsole, eRender,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, WAVEFORMATEX, eConsole, eRender,
 };
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -55,6 +75,7 @@ use windows::core::PCWSTR;
 
 use crate::capture::{StreamFormat, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT};
 use crate::error::AudioError;
+use crate::rt_priority::RealTimeBoost;
 
 // ---------------------------------------------------------------------------
 // SampleBuffer — the thread-safe queue between capture and render
@@ -66,6 +87,11 @@ use crate::error::AudioError;
 // so that steady-state operation is allocation-free. Both ends hold an
 // Arc<Mutex<SampleBuffer>>, and the lock is held for microseconds at a time.
 // ---------------------------------------------------------------------------
+
+/// Ring capacity in milliseconds of stereo audio. This is the hard ceiling on
+/// backlog; the drift trim (see run_render_loop) keeps the steady-state
+/// backlog far below it, so this is purely emergency headroom.
+const RING_CAPACITY_MS: usize = 200;
 
 /// Pre-allocated sample queue connecting the capture thread to the render thread.
 pub struct SampleBuffer {
@@ -85,6 +111,14 @@ impl SampleBuffer {
     /// the oldest samples are silently dropped. This is preferable to blocking
     /// the capture thread or panicking.
     fn write(&mut self, samples: &[f32]) {
+        // If the incoming slice alone exceeds the whole capacity, only its
+        // newest samples can survive anyway — clamp before the drain below so
+        // the excess computation can never exceed what is actually queued.
+        let samples = if samples.len() > self.capacity {
+            &samples[samples.len() - self.capacity..]
+        } else {
+            samples
+        };
         if self.inner.len() + samples.len() > self.capacity {
             let excess = (self.inner.len() + samples.len()) - self.capacity;
             self.inner.drain(..excess);
@@ -116,6 +150,39 @@ impl SampleBuffer {
     /// How many samples are currently queued.
     pub fn available(&self) -> usize {
         self.inner.len()
+    }
+
+    /// If more than `max_len` samples are queued, drops the oldest so that
+    /// only `target_len` remain. Returns the number of samples dropped
+    /// (0 when the backlog is within bounds — the common case).
+    ///
+    /// Used by the render loop to bound pipeline latency: clock drift between
+    /// the capture and render devices makes the backlog grow slowly, and
+    /// without trimming, audio latency would creep up to the full ring
+    /// capacity. Dropping down to `target_len` (rather than `max_len`) means
+    /// trims are infrequent — the backlog must re-grow the whole gap before
+    /// the next one.
+    fn trim_excess(&mut self, max_len: usize, target_len: usize) -> usize {
+        if self.inner.len() <= max_len {
+            return 0;
+        }
+        let excess = self.inner.len() - target_len.min(max_len);
+        self.inner.drain(..excess);
+        excess
+    }
+
+    /// Re-sizes the buffer to a new capacity, dropping the oldest samples if
+    /// the current contents exceed it.
+    ///
+    /// Called once at render startup, when the device's real sample rate
+    /// becomes known — the buffer is first allocated assuming 48 kHz, and a
+    /// 96/192 kHz device needs proportionally more samples to hold the same
+    /// RING_CAPACITY_MS of audio. This allocates, so it must never be called
+    /// from the steady-state audio path.
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        self.trim_excess(capacity, capacity);
+        self.inner.reserve(capacity.saturating_sub(self.inner.len()));
     }
 }
 
@@ -171,8 +238,10 @@ impl WasapiRenderer {
     ///
     /// 200 ms at 48 kHz stereo = 48 000 × 2 × 0.2 = 19 200 f32 samples.
     /// This absorbs timing jitter between the capture and render threads.
+    /// The render thread re-sizes it via set_capacity() once the device's
+    /// actual sample rate is known (a 192 kHz device needs 4× the samples).
     pub fn new() -> Self {
-        let ring_capacity = 48_000 * 2 * 200 / 1000; // samples (not bytes)
+        let ring_capacity = 48_000 * 2 * RING_CAPACITY_MS / 1000; // samples (not bytes)
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
             thread_handle: None,
@@ -285,13 +354,43 @@ fn render_thread_main(
         Err(e) => { let _ = format_tx.send(Err(e)); return; }
     };
 
-    let (audio_client, render_client, format, device_period) =
-        match open_render_device(device_id.as_deref()) {
+    // Boost this thread into the MMCSS "Pro Audio" scheduling class and raise
+    // the system timer to 1 ms resolution, so the thread keeps getting
+    // scheduled promptly even when other programs saturate the CPU.
+    // The guard reverts both boosts when the thread exits.
+    let _boost = RealTimeBoost::enable("render");
+
+    // Create the event WASAPI will signal once per device period.
+    // Auto-reset (bManualReset = false): each WaitForSingleObject consumes
+    // one signal, which is exactly the one-wake-per-period semantics we want.
+    //
+    // unsafe: CreateEventW with default security, no name — no preconditions.
+    let event = match unsafe { CreateEventW(None, false, false, PCWSTR::null()) } {
+        Ok(h) => h,
+        Err(e) => { let _ = format_tx.send(Err(AudioError::Windows(e))); return; }
+    };
+    // RAII: the OS event handle is closed when the thread exits, whatever path
+    // it takes. Declared after _com/_boost so it drops before them — order is
+    // irrelevant here, but the handle must be wrapped before any early return.
+    let _event_guard = EventHandleGuard(event);
+
+    let (audio_client, render_client, format) =
+        match open_render_device(device_id.as_deref(), event) {
             Ok(v) => v,
             Err(e) => { let _ = format_tx.send(Err(e)); return; }
         };
 
     let _ = format_tx.send(Ok(format));
+
+    // The ring was pre-allocated assuming 48 kHz. Now that the device's real
+    // rate is known, re-size it so it holds RING_CAPACITY_MS of audio at the
+    // actual rate (the ring always stores stereo, hence × 2). This is the one
+    // permitted allocation — it happens once, before Start(), never in the
+    // steady-state loop.
+    {
+        let mut buf = ring.lock().unwrap();
+        buf.set_capacity(format.sample_rate as usize * 2 * RING_CAPACITY_MS / 1000);
+    }
 
     // unsafe: Start() is valid after a successful Initialize() (done in open_render_device).
     if let Err(e) = unsafe { audio_client.Start() } {
@@ -299,17 +398,13 @@ fn render_thread_main(
         return;
     }
 
-    // Sleep for half the device period between refill cycles.
-    // device_period is in 100-nanosecond units.
-    let sleep_duration = Duration::from_nanos(device_period as u64 * 100 / 2);
-
     run_render_loop(
         &stop_flag,
         &ring,
         &audio_client,
         &render_client,
         &format,
-        sleep_duration,
+        event,
         &volume,
         &output_gain,
     );
@@ -324,7 +419,7 @@ fn run_render_loop(
     audio_client: &IAudioClient,
     render_client: &IAudioRenderClient,
     format: &StreamFormat,
-    sleep_duration: Duration,
+    event: HANDLE,
     volume: &AtomicU32,
     output_gain: &AtomicU32,
 ) {
@@ -339,8 +434,38 @@ fn run_render_loop(
         Err(e) => { eprintln!("[eq-audio] GetBufferSize: {e}"); return; }
     };
 
+    // --- Drift-trim thresholds (all in ring samples; ring is always stereo) ---
+    //
+    // The backlog normally hovers near zero. If the capture clock runs even
+    // slightly faster than the render clock, it grows without bound — each
+    // extra queued sample is a sample of added latency. When the backlog
+    // exceeds MAX (60 ms) we cut it back to TARGET (20 ms). The 40 ms gap
+    // between the two means a typical clock drift (~100 ppm) triggers a trim
+    // only every several minutes. TARGET is kept above zero so a cushion
+    // remains against ordinary scheduling jitter.
+    let samples_per_ms = (format.sample_rate as usize * 2) / 1000;
+    let max_backlog    = 60 * samples_per_ms;
+    let target_backlog = 20 * samples_per_ms;
+
+    // Fade-in applied after a trim: dropping samples mid-stream creates a
+    // waveform discontinuity (a click). Ramping the output from silence to
+    // full level over ~5 ms turns that click into an inaudible dip.
+    // fade_frames_left counts down per output frame across buffer boundaries.
+    let fade_total_frames = (format.sample_rate as usize * 5 / 1000).max(1);
+    let mut fade_frames_left: usize = 0;
+
     while !stop_flag.load(Ordering::Relaxed) {
-        thread::sleep(sleep_duration);
+        // Block until the audio engine signals that buffer space is available
+        // (once per device period). The 200 ms timeout is a safety net: if the
+        // device stalls (e.g. invalidated mid-stream), we still wake up to
+        // check the stop flag and let GetCurrentPadding surface the error.
+        //
+        // unsafe: event is a valid handle owned by this thread's EventHandleGuard.
+        let wait = unsafe { WaitForSingleObject(event, 200) };
+        if wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT {
+            eprintln!("[eq-audio] render event wait failed: {:?}", wait);
+            break;
+        }
 
         // unsafe: GetCurrentPadding is valid on a started client.
         let padding = match unsafe { audio_client.GetCurrentPadding() } {
@@ -351,6 +476,20 @@ fn run_render_loop(
         let available_frames = buf_size.saturating_sub(padding);
         if available_frames == 0 {
             continue;
+        }
+
+        // Bound pipeline latency: cut the backlog back down if clock drift
+        // has let it grow past the threshold (see constants above).
+        let dropped = {
+            let mut buf = ring.lock().unwrap();
+            buf.trim_excess(max_backlog, target_backlog)
+        };
+        if dropped > 0 {
+            fade_frames_left = fade_total_frames;
+            eprintln!(
+                "[eq-audio] latency trim: dropped {} ms of drift backlog",
+                dropped / samples_per_ms.max(1)
+            );
         }
 
         // unsafe: GetBuffer returns a pointer to available_frames * channels * 4 bytes
@@ -413,7 +552,22 @@ fn run_render_loop(
         let vol  = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
         let gain = f32::from_bits(output_gain.load(Ordering::Relaxed)).clamp(0.0, 4.0);
         let combined = vol * gain;
-        if (combined - 1.0).abs() > 0.0001 {
+        if fade_frames_left > 0 {
+            // Post-trim fade-in: scale each output frame by a ramp that rises
+            // from 0 to 1 over fade_total_frames, folding the volume scalar in
+            // at the same time. All channels of a frame get the same gain so
+            // the stereo image is unaffected. Frames past the end of the ramp
+            // (within this same buffer) fall through to full level naturally.
+            let ch = format.channels as usize;
+            for frame in render_slice.chunks_exact_mut(ch) {
+                let ramp = 1.0 - (fade_frames_left as f32 / fade_total_frames as f32);
+                let g = combined * ramp;
+                for s in frame.iter_mut() {
+                    *s = (*s * g).clamp(-1.0, 1.0);
+                }
+                fade_frames_left = fade_frames_left.saturating_sub(1);
+            }
+        } else if (combined - 1.0).abs() > 0.0001 {
             for s in render_slice.iter_mut() {
                 *s = (*s * combined).clamp(-1.0, 1.0);
             }
@@ -436,11 +590,15 @@ fn run_render_loop(
 // ---------------------------------------------------------------------------
 
 /// Opens the requested render endpoint (or the system default if `device_id` is None),
-/// initialises it for shared-mode output, and returns the client, render client,
-/// stream format, and device period (in 100-ns units).
+/// initialises it for event-driven shared-mode output, and returns the client,
+/// render client, and stream format.
+///
+/// `event` — an auto-reset event handle (owned by the caller) that WASAPI
+/// will signal once per device period when buffer space becomes available.
 fn open_render_device(
     device_id: Option<&str>,
-) -> Result<(IAudioClient, IAudioRenderClient, StreamFormat, i64), AudioError> {
+    event: HANDLE,
+) -> Result<(IAudioClient, IAudioRenderClient, StreamFormat), AudioError> {
     // unsafe: CoCreateInstance — same rationale as in capture.rs.
     let enumerator: IMMDeviceEnumerator = unsafe {
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?
@@ -464,20 +622,18 @@ fn open_render_device(
     let fmt_ptr: *mut WAVEFORMATEX = unsafe { audio_client.GetMixFormat()? };
     let parse_result = unsafe { parse_render_format(fmt_ptr) };
 
-    // Query the device period so we know how long to sleep between fills.
-    let mut default_period: i64 = 100_000; // 10 ms fallback if call fails
-    unsafe {
-        let _ = audio_client.GetDevicePeriod(Some(&mut default_period), None);
-    }
-
     // Initialise using the ORIGINAL format pointer from GetMixFormat.
     // This correctly handles multi-channel devices (5.1, 7.1) without needing
     // to reconstruct WAVEFORMATEXTENSIBLE with the correct channel mask.
+    //
+    // AUDCLNT_STREAMFLAGS_EVENTCALLBACK: instead of us guessing when to
+    // refill (sleep-and-poll), the audio engine signals our event exactly
+    // when buffer space becomes available each period.
     let init_result = unsafe {
         audio_client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            0,    // no special flags (no loopback — this is the render side)
-            0,    // use device-minimum buffer
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            0,    // buffer duration: let the engine choose its default
             0,    // periodicity: 0 for shared mode
             fmt_ptr as *const WAVEFORMATEX,
             None,
@@ -490,10 +646,34 @@ fn open_render_device(
     let stream_format = parse_result?;
     init_result?;
 
+    // Register the caller's event with the audio client. Required when
+    // EVENTCALLBACK is set; must happen after Initialize and before Start.
+    // unsafe: audio_client is initialised and event is a valid handle.
+    unsafe { audio_client.SetEventHandle(event)? };
+
     // unsafe: audio_client is successfully initialised.
     let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
 
-    Ok((audio_client, render_client, stream_format, default_period))
+    Ok((audio_client, render_client, stream_format))
+}
+
+// ---------------------------------------------------------------------------
+// OS event handle guard
+// ---------------------------------------------------------------------------
+
+/// RAII wrapper that closes a Win32 event handle on drop.
+///
+/// The render thread creates one event for its lifetime; this guard
+/// guarantees the handle is released on every exit path (setup failure,
+/// device error, normal stop).
+struct EventHandleGuard(HANDLE);
+
+impl Drop for EventHandleGuard {
+    fn drop(&mut self) {
+        // unsafe: self.0 came from a successful CreateEventW and is closed
+        // exactly once (the guard is never cloned).
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }
 
 /// Validates that the render device's mix format is float32 stereo.
@@ -553,6 +733,7 @@ impl Drop for ComGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn new_renderer_is_not_running() {
@@ -594,6 +775,51 @@ mod tests {
         let mut out = [0.0f32; 4];
         buf.read_into(&mut out);
         assert_eq!(out, [3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn trim_excess_is_noop_within_bounds() {
+        let mut buf = SampleBuffer::new(16);
+        buf.write(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(buf.trim_excess(8, 2), 0); // 4 ≤ 8 → untouched
+        assert_eq!(buf.available(), 4);
+    }
+
+    #[test]
+    fn trim_excess_drops_oldest_down_to_target() {
+        let mut buf = SampleBuffer::new(16);
+        buf.write(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let dropped = buf.trim_excess(4, 2); // 6 > 4 → keep newest 2
+        assert_eq!(dropped, 4);
+
+        let mut out = [0.0f32; 2];
+        buf.read_into(&mut out);
+        assert_eq!(out, [5.0, 6.0]);
+        assert_eq!(buf.available(), 0);
+    }
+
+    #[test]
+    fn set_capacity_shrink_drops_oldest() {
+        let mut buf = SampleBuffer::new(16);
+        buf.write(&[1.0, 2.0, 3.0, 4.0]);
+        buf.set_capacity(2);
+        assert_eq!(buf.available(), 2);
+
+        let mut out = [0.0f32; 2];
+        buf.read_into(&mut out);
+        assert_eq!(out, [3.0, 4.0]); // newest survive
+
+        // Writes now overflow at the new, smaller capacity.
+        buf.write(&[1.0, 2.0, 3.0]);
+        assert_eq!(buf.available(), 2);
+    }
+
+    #[test]
+    fn set_capacity_grow_allows_more_samples() {
+        let mut buf = SampleBuffer::new(2);
+        buf.set_capacity(6);
+        buf.write(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(buf.available(), 6); // no longer clipped at 2
     }
 
     #[test]
