@@ -54,6 +54,21 @@ use eq_core::{CrossfeedProcessor, FilterChain};
 use crate::error::AudioError;
 use crate::rt_priority::RealTimeBoost;
 
+/// Capture buffer duration requested from WASAPI, in milliseconds.
+///
+/// A capture buffer is a holding area Windows fills for us. A bigger one does
+/// NOT add latency — we drain it as fast as packets arrive — it only adds
+/// slack, so the capture thread can be starved by a CPU spike for far longer
+/// before Windows runs out of room and starts dropping loopback data (audible
+/// as static). The device minimum is ~20 ms; 200 ms gives an order of
+/// magnitude more headroom.
+///
+/// This also sizes `processing_buf` (see `capture_thread_main`): after a stall,
+/// a driver may hand back accumulated data rather than a strict period-sized
+/// packet, so the working buffer is sized to swallow a whole capture buffer in
+/// one pass rather than assuming a packet never exceeds one device period.
+const CAPTURE_BUFFER_MS: usize = 200;
+
 // ---------------------------------------------------------------------------
 // WAVE_FORMAT_* tag constants (from the Windows Multimedia SDK)
 //
@@ -271,9 +286,16 @@ fn capture_thread_main(
     }
 
     // Pre-allocate the processing buffer once so the hot loop never allocates.
-    // 8192 stereo f32 samples covers 192 kHz × 2 ch × ~21 ms — larger than any
-    // WASAPI shared-mode or exclusive-mode buffer we expect in practice.
-    let mut processing_buf: Vec<f32> = Vec::with_capacity(8192);
+    //
+    // Sized from the device's ACTUAL sample rate and the capture buffer we
+    // requested, not a hardcoded constant. The old 8192-sample figure assumed a
+    // packet never exceeds one device period — true when Initialize asked for
+    // the device minimum, but not once we request CAPTURE_BUFFER_MS: after a
+    // stall a driver may hand back accumulated data, and at 192 kHz the old
+    // limit was off by more than 2x. The buffer always holds stereo (2 samples
+    // per frame) regardless of the source channel count.
+    let processing_capacity = CAPTURE_BUFFER_MS * format.sample_rate as usize * 2 / 1000;
+    let mut processing_buf: Vec<f32> = Vec::with_capacity(processing_capacity.max(2));
 
     run_capture_loop(
         &stop_flag,
@@ -352,34 +374,38 @@ fn run_capture_loop(
                     slice::from_raw_parts(data_ptr as *const f32, n_samples)
                 };
 
-                // The output is always stereo regardless of source channel count.
-                let stereo_samples = num_frames as usize * 2;
+                // Process the packet in passes that each fit the pre-allocated
+                // buffer, rather than skipping anything too large for it.
+                //
+                // processing_buf is sized to hold a whole capture buffer, so in
+                // practice this is a single pass. But a driver is free to hand
+                // back more than we sized for, and dropping such a packet would
+                // silently discard up to CAPTURE_BUFFER_MS of audio. Splitting
+                // is exactly equivalent to processing the packet whole: the
+                // FilterChain and CrossfeedProcessor are sequential per-sample
+                // state machines, so feeding them consecutive slices of the same
+                // packet produces the same output as one contiguous call.
+                //
+                // The buffer holds stereo, so capacity/2 frames fit per pass.
+                let ch = format.channels as usize;
+                let frames_per_pass = (processing_buf.capacity() / 2).max(1);
 
-                // Guard: skip packets that exceed our pre-allocated capacity rather
-                // than letting Vec reallocate on the audio thread. At 192 kHz × 2 ch
-                // a 21 ms period = 8064 samples — well within our 8192 limit.
-                if stereo_samples > processing_buf.capacity() {
-                    eprintln!(
-                        "[eq-audio] oversized packet ({stereo_samples} stereo samples > {} capacity), skipping",
-                        processing_buf.capacity()
-                    );
-                } else {
+                for chunk in samples.chunks(frames_per_pass * ch) {
                     // Copy into the pre-allocated processing buffer.
                     // For stereo: copy the whole slice directly.
                     // For multi-channel (5.1, 7.1, etc.): extract only channels 0 (L)
                     // and 1 (R) from each frame — the FilterChain always works in stereo.
                     processing_buf.clear();
-                    if format.channels == 2 {
-                        processing_buf.extend_from_slice(samples);
+                    if ch == 2 {
+                        processing_buf.extend_from_slice(chunk);
                     } else {
-                        let ch = format.channels as usize;
-                        for frame in samples.chunks_exact(ch) {
+                        for frame in chunk.chunks_exact(ch) {
                             processing_buf.push(frame[0]); // L
                             processing_buf.push(frame[1]); // R
                         }
                     }
 
-                    // Apply the EQ. Lock is acquired and released per packet, so
+                    // Apply the EQ. Lock is acquired and released per pass, so
                     // the control thread can update bands between packets.
                     {
                         let mut chain = filter_chain.lock().unwrap();
@@ -470,18 +496,16 @@ fn open_loopback(capture_device_id: Option<&str>) -> Result<(IAudioClient, IAudi
     //
     // AUDCLNT_STREAMFLAGS_LOOPBACK: read the already-mixed render stream.
     //
-    // Buffer duration: 200 ms (in 100-nanosecond units) instead of the device
-    // minimum (~20 ms). A capture buffer is a holding area Windows fills for
-    // us — a bigger one does NOT add latency, because we drain it as fast as
-    // packets arrive; it only adds slack. With 200 ms of slack, our thread can
-    // be starved by a CPU spike for far longer before Windows runs out of room
-    // and starts dropping loopback data (which is audible as static).
-    const CAPTURE_BUFFER_DURATION_HNS: i64 = 200 * 10_000; // 200 ms in 100-ns units
+    // Buffer duration: CAPTURE_BUFFER_MS (see the constant at the top of this
+    // file for why 200 ms rather than the device minimum), converted to the
+    // 100-nanosecond units WASAPI expects.
+    const HNS_PER_MS: i64 = 10_000;
+    let buffer_duration_hns = CAPTURE_BUFFER_MS as i64 * HNS_PER_MS;
     let init_result = unsafe {
         audio_client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
-            CAPTURE_BUFFER_DURATION_HNS,
+            buffer_duration_hns,
             0,    // periodicity: must be 0 in shared mode
             fmt_ptr as *const WAVEFORMATEX,
             None, // audio session GUID: use default session
@@ -724,5 +748,81 @@ mod tests {
         capture.stop();
 
         assert!(all_in_range.load(Ordering::Relaxed), "samples exceeded [-1.0, 1.0]");
+    }
+
+    // --- Packet chunking (no hardware needed) ---
+    //
+    // run_capture_loop splits an oversized WASAPI packet into passes that each
+    // fit `processing_buf`, instead of dropping it. That is only sound because
+    // FilterChain and CrossfeedProcessor are sequential per-sample state
+    // machines: feeding them consecutive slices of one packet must produce
+    // bit-identical output to one contiguous call. These tests pin that down —
+    // if either processor ever gained block-scoped state, they would fail here
+    // rather than as intermittent distortion on a stalled capture thread.
+
+    /// Builds a deterministic stereo test signal: interleaved [L, R, L, R, ...].
+    fn test_signal(frames: usize) -> Vec<f32> {
+        (0..frames * 2)
+            .map(|i| ((i as f32) * 0.017).sin() * 0.5)
+            .collect()
+    }
+
+    #[test]
+    fn chunked_filter_processing_matches_contiguous() {
+        use eq_core::{BandConfig, FilterChain, FilterType};
+
+        let mut band = BandConfig::new(FilterType::Peak, 1000.0);
+        band.gain_db = 9.0;
+        band.q = 1.4;
+
+        let frames = 5000; // larger than any single pass below
+        let signal = test_signal(frames);
+
+        // Whole-packet reference.
+        let mut whole = signal.clone();
+        let mut chain = FilterChain::new(48_000.0);
+        chain.set_bands(&[band.clone()]);
+        chain.process_interleaved(&mut whole);
+
+        // Same data through a fresh chain, split into passes of 512 frames.
+        let mut chunked = signal.clone();
+        let mut chain2 = FilterChain::new(48_000.0);
+        chain2.set_bands(&[band]);
+        for pass in chunked.chunks_mut(512 * 2) {
+            chain2.process_interleaved(pass);
+        }
+
+        // Guard against a vacuous pass: the filter must actually alter the signal,
+        // otherwise this would compare two untouched copies.
+        assert_ne!(whole, signal, "test filter was a no-op; the comparison proves nothing");
+        assert_eq!(whole, chunked, "splitting a packet changed the filtered output");
+    }
+
+    #[test]
+    fn chunked_crossfeed_processing_matches_contiguous() {
+        use eq_core::{CrossfeedConfig, CrossfeedLevel, CrossfeedProcessor};
+
+        let config = CrossfeedConfig { enabled: true, level: CrossfeedLevel::Moderate };
+
+        let frames = 5000;
+        let signal = test_signal(frames);
+
+        let mut whole = signal.clone();
+        let mut cf = CrossfeedProcessor::new();
+        cf.update_config(&config, 48_000.0);
+        cf.process_interleaved(&mut whole);
+
+        let mut chunked = signal.clone();
+        let mut cf2 = CrossfeedProcessor::new();
+        cf2.update_config(&config, 48_000.0);
+        // An uneven split, so the delay-line ring buffers are exercised across
+        // pass boundaries that do not line up with their internal size.
+        for pass in chunked.chunks_mut(333 * 2) {
+            cf2.process_interleaved(pass);
+        }
+
+        // Guard against a vacuous pass (see above).
+        assert_ne!(whole, signal, "crossfeed was a no-op; the comparison proves nothing");
+        assert_eq!(whole, chunked, "splitting a packet changed the crossfeed output");
     }
 }

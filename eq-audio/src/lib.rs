@@ -30,7 +30,7 @@ mod rt_priority;
 
 pub use error::AudioError;
 pub use capture::{LoopbackCapture, StreamFormat};
-pub use render::{WasapiRenderer, RenderSender};
+pub use render::{WasapiRenderer, RenderSender, TrimStats};
 pub use device::{AudioDeviceInfo, list_render_devices};
 pub use session::{AudioSessionInfo, list_audio_sessions, get_foreground_process_name, set_process_volume};
 pub use spectrum::{SpectrumAnalyzer, SPECTRUM_BANDS};

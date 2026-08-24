@@ -36,6 +36,8 @@
 // priority — degraded but functional beats refusing to start.
 // =============================================================================
 
+use std::marker::PhantomData;
+
 use windows::core::w;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
@@ -49,9 +51,14 @@ use windows::Win32::System::Threading::{
 /// and keep it alive for the thread's lifetime. Dropping it reverts both the
 /// MMCSS registration and the timer resolution.
 ///
-/// The boost applies to the thread that calls `enable()` — the guard must be
-/// created and dropped on the same thread (it is intentionally !Send by way
-/// of holding a raw MMCSS handle tied to this thread's registration).
+/// The boost applies to the thread that calls `enable()`, and the guard must be
+/// created and dropped on that same thread: `AvRevertMmThreadCharacteristics`
+/// undoes the registration of whichever thread calls it, so reverting from the
+/// wrong thread would leave the audio thread boosted forever and demote an
+/// unrelated one.
+///
+/// That rule is enforced by the type rather than merely documented — see the
+/// `_not_send` field below.
 pub(crate) struct RealTimeBoost {
     /// MMCSS registration handle, or None if registration failed.
     /// Needed by AvRevertMmThreadCharacteristics on drop.
@@ -60,6 +67,18 @@ pub(crate) struct RealTimeBoost {
     /// Whether our timeBeginPeriod(1) call succeeded and needs the matching
     /// timeEndPeriod(1) on drop. (Windows requires the calls to be paired.)
     timer_raised: bool,
+
+    /// Makes the guard `!Send` explicitly. A raw pointer is `!Send`, and a
+    /// `PhantomData` of one propagates that without occupying any space.
+    ///
+    /// `HANDLE` in windows 0.58 happens to wrap `*mut c_void`, which already
+    /// makes this struct `!Send` on its own — but that is an implementation
+    /// detail of that crate, and windows-rs has changed `HANDLE`'s
+    /// representation across versions. Stating the requirement here means a
+    /// dependency bump cannot silently turn this guard into something movable
+    /// across threads, which would let `Drop` revert the MMCSS registration
+    /// from the wrong one.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl RealTimeBoost {
@@ -95,7 +114,7 @@ impl RealTimeBoost {
             }
         };
 
-        Self { mmcss_handle, timer_raised }
+        Self { mmcss_handle, timer_raised, _not_send: PhantomData }
     }
 }
 

@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "eq-audio"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "eq-core",
  "rustfft",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "eq-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "approx",
  "serde",
@@ -3462,7 +3462,7 @@ dependencies = [
 
 [[package]]
 name = "soundeq"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "eq-audio",
  "eq-core",

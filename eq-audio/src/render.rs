@@ -93,6 +93,74 @@ use crate::rt_priority::RealTimeBoost;
 /// backlog far below it, so this is purely emergency headroom.
 const RING_CAPACITY_MS: usize = 200;
 
+/// Moves the trim-masking ramp one frame toward `target`, in integer positions.
+///
+/// The ramp (see `run_render_loop`) is stored as an integer position in
+/// `0..=fade_total_frames` and converted to a gain of `pos / total` only where
+/// it is used. Accumulating an `f32` multiplier instead would drift: 240 steps
+/// of `1.0 / 240.0` lands on 7.9e-7 rather than 0.0, so the `pos == 0` test that
+/// releases the pending trim would never fire and the backlog would grow
+/// forever. Integer positions make both endpoints exact by construction.
+#[inline]
+fn step_ramp_pos(pos: usize, target: usize) -> usize {
+    match pos.cmp(&target) {
+        std::cmp::Ordering::Less => pos + 1,
+        std::cmp::Ordering::Greater => pos - 1,
+        std::cmp::Ordering::Equal => pos,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrimStats — drift-trim telemetry
+//
+// The render loop used to report each trim with `eprintln!`. That formats a
+// String (a heap allocation) and takes the process-wide stderr lock, both from
+// inside the render period — against this project's rule that the audio thread
+// never allocates, and a real hazard: if stderr is a slow or blocked console or
+// pipe, the write stalls the render thread past its device period and causes
+// exactly the underrun the message was reporting.
+//
+// Instead the render thread does a pair of relaxed atomic adds — wait-free, no
+// allocation, no lock, no syscall — and any control thread reads the totals at
+// its leisure. A single human-readable summary is printed once when the render
+// loop exits, which is off the hot path entirely.
+// ---------------------------------------------------------------------------
+
+/// Cumulative counters describing drift trims performed by the render loop.
+///
+/// Shared between the render thread (writer) and any control thread (reader)
+/// via `WasapiRenderer::trim_stats()`. `Relaxed` ordering is sufficient: these
+/// are independent counters used for diagnostics, with no happens-before
+/// relationship to any other state.
+#[derive(Default)]
+pub struct TrimStats {
+    count: AtomicU32,
+    total_ms: AtomicU32,
+}
+
+impl TrimStats {
+    /// Records one trim. Called from the render thread on the hot path, so this
+    /// must stay allocation-free and lock-free — two atomic adds, nothing else.
+    #[inline]
+    fn record(&self, dropped_ms: u32) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_ms.fetch_add(dropped_ms, Ordering::Relaxed);
+    }
+
+    /// Trims so far, as `(count, total milliseconds of audio discarded)`.
+    ///
+    /// A steadily climbing count is normal — clock drift between the capture and
+    /// render devices makes a trim inevitable every few minutes. A count that
+    /// climbs *fast* means the capture thread is being starved and dumping
+    /// bursts into the ring, which is worth investigating.
+    pub fn snapshot(&self) -> (u32, u32) {
+        (
+            self.count.load(Ordering::Relaxed),
+            self.total_ms.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Pre-allocated sample queue connecting the capture thread to the render thread.
 pub struct SampleBuffer {
     inner: VecDeque<f32>,
@@ -231,6 +299,9 @@ pub struct WasapiRenderer {
     /// the render loop. Default 1.0. Allows compensating for VB-Cable's lower
     /// inherent signal level relative to direct device output.
     output_gain: Arc<AtomicU32>,
+    /// Drift-trim telemetry. Written by the render thread with wait-free atomic
+    /// adds instead of printing from the hot path; read by control threads.
+    trim_stats: Arc<TrimStats>,
 }
 
 impl WasapiRenderer {
@@ -248,6 +319,7 @@ impl WasapiRenderer {
             ring: Arc::new(Mutex::new(SampleBuffer::new(ring_capacity))),
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             output_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            trim_stats: Arc::new(TrimStats::default()),
         }
     }
 
@@ -261,6 +333,12 @@ impl WasapiRenderer {
     /// Write a f32 value (clamped to [0.0, 4.0] by the render loop) as bits.
     pub fn gain_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.output_gain)
+    }
+
+    /// Returns the drift-trim counters so a control thread can observe how often
+    /// the render loop has had to discard backlog. See `TrimStats::snapshot`.
+    pub fn trim_stats(&self) -> Arc<TrimStats> {
+        Arc::clone(&self.trim_stats)
     }
 
     /// Returns a `RenderSender` that can be used to push audio into the render queue.
@@ -288,10 +366,11 @@ impl WasapiRenderer {
 
         let volume = Arc::clone(&self.volume);
         let output_gain = Arc::clone(&self.output_gain);
+        let trim_stats = Arc::clone(&self.trim_stats);
         let handle = thread::Builder::new()
             .name("wasapi-render".to_string())
             .spawn(move || {
-                render_thread_main(stop_flag, ring, device_id, format_tx, volume, output_gain);
+                render_thread_main(stop_flag, ring, device_id, format_tx, volume, output_gain, trim_stats);
             })?;
 
         self.thread_handle = Some(handle);
@@ -346,6 +425,7 @@ fn render_thread_main(
     format_tx: SyncSender<Result<StreamFormat, AudioError>>,
     volume: Arc<AtomicU32>,
     output_gain: Arc<AtomicU32>,
+    trim_stats: Arc<TrimStats>,
 ) {
     // COM must be initialised per-thread.
     // _com must be declared FIRST so it is dropped LAST (after all COM objects).
@@ -380,17 +460,25 @@ fn render_thread_main(
             Err(e) => { let _ = format_tx.send(Err(e)); return; }
         };
 
-    let _ = format_tx.send(Ok(format));
-
     // The ring was pre-allocated assuming 48 kHz. Now that the device's real
     // rate is known, re-size it so it holds RING_CAPACITY_MS of audio at the
     // actual rate (the ring always stores stereo, hence × 2). This is the one
     // permitted allocation — it happens once, before Start(), never in the
     // steady-state loop.
+    //
+    // This MUST happen before `format_tx.send` below. That send is what unblocks
+    // `WasapiRenderer::start()`, which lets `AudioEngine::start()` go on to spawn
+    // the capture thread — and that thread's callback writes straight into this
+    // ring. Publishing the format first would leave a window where early capture
+    // writes are clipped to the stale 48 kHz capacity (four times too small on a
+    // 192 kHz device), and where this `reserve` allocates while holding the very
+    // lock the capture thread is contending for.
     {
         let mut buf = ring.lock().unwrap();
         buf.set_capacity(format.sample_rate as usize * 2 * RING_CAPACITY_MS / 1000);
     }
+
+    let _ = format_tx.send(Ok(format));
 
     // unsafe: Start() is valid after a successful Initialize() (done in open_render_device).
     if let Err(e) = unsafe { audio_client.Start() } {
@@ -407,6 +495,7 @@ fn render_thread_main(
         event,
         &volume,
         &output_gain,
+        &trim_stats,
     );
 
     let _ = unsafe { audio_client.Stop() };
@@ -422,6 +511,7 @@ fn run_render_loop(
     event: HANDLE,
     volume: &AtomicU32,
     output_gain: &AtomicU32,
+    trim_stats: &TrimStats,
 ) {
     // GetBufferSize returns the total WASAPI buffer capacity in frames, which
     // is fixed after Initialize() and never changes. Query it once here so the
@@ -438,21 +528,43 @@ fn run_render_loop(
     //
     // The backlog normally hovers near zero. If the capture clock runs even
     // slightly faster than the render clock, it grows without bound — each
-    // extra queued sample is a sample of added latency. When the backlog
-    // exceeds MAX (60 ms) we cut it back to TARGET (20 ms). The 40 ms gap
-    // between the two means a typical clock drift (~100 ppm) triggers a trim
-    // only every several minutes. TARGET is kept above zero so a cushion
-    // remains against ordinary scheduling jitter.
-    let samples_per_ms = (format.sample_rate as usize * 2) / 1000;
+    // extra queued sample is a sample of added latency.
+    //
+    // Critically, a backlog spike never drains on its own. Capture and render
+    // run at the same nominal rate, so whatever burst the capture thread dumps
+    // into the ring after a stall just sits there as permanent added latency
+    // until something trims it. MAX is therefore a deliberate latency budget,
+    // not a jitter guard: we accept up to 60 ms of pipeline backlog, and past
+    // that we choose to drop audio rather than let the delay keep creeping up.
+    // TARGET (20 ms) is where a trim lands; the 40 ms gap means ordinary clock
+    // drift (~100 ppm) triggers a trim only every several minutes, and TARGET
+    // stays above zero so a cushion remains against ordinary jitter.
+    let samples_per_ms = ((format.sample_rate as usize * 2) / 1000).max(1);
     let max_backlog    = 60 * samples_per_ms;
     let target_backlog = 20 * samples_per_ms;
 
-    // Fade-in applied after a trim: dropping samples mid-stream creates a
-    // waveform discontinuity (a click). Ramping the output from silence to
-    // full level over ~5 ms turns that click into an inaudible dip.
-    // fade_frames_left counts down per output frame across buffer boundaries.
+    // --- Trim masking ramp ---
+    //
+    // Dropping samples mid-stream creates a waveform discontinuity — a click.
+    // A fade-IN after the cut cannot remove it: the previous buffer is already
+    // with the driver, ending at some arbitrary sample value V, so starting the
+    // next buffer from zero merely swaps one step (V -> W) for another (V -> 0).
+    // The cut has to happen when the output is ALREADY at silence.
+    //
+    // So a trim runs as a three-phase state machine driven by a continuous
+    // per-frame gain ramp, held as an integer position in 0..=fade_total_frames
+    // (gain = pos / fade_total_frames):
+    //   1. backlog over budget -> ramp_target_pos = 0, the output fades out
+    //   2. pos reaches 0       -> splice the ring (0.0 joined to 0.0: no click)
+    //   3. ramp_target_pos = fade_total_frames -> the output fades back in
+    //
+    // Because the position moves by at most one frame per sample frame and
+    // carries across buffer boundaries, the rendered waveform stays continuous
+    // throughout. The audible result is a ~10 ms dip rather than a click.
     let fade_total_frames = (format.sample_rate as usize * 5 / 1000).max(1);
-    let mut fade_frames_left: usize = 0;
+    let mut ramp_pos = fade_total_frames;        // current position (full level)
+    let mut ramp_target_pos = fade_total_frames; // where the ramp is heading
+    let mut awaiting_trim = false;
 
     while !stop_flag.load(Ordering::Relaxed) {
         // Block until the audio engine signals that buffer space is available
@@ -474,22 +586,40 @@ fn run_render_loop(
         };
 
         let available_frames = buf_size.saturating_sub(padding);
-        if available_frames == 0 {
-            continue;
+
+        // Phase 2 of the trim state machine: the output has finished fading
+        // out, so the ring can be spliced now — at silence, where the cut joins
+        // 0.0 to 0.0 and produces no discontinuity at all.
+        //
+        // This sits ABOVE the `available_frames == 0` early-continue on
+        // purpose: on a device whose buffer happens to be full at wake time,
+        // skipping the trim would let the backlog grow unbounded while the trim
+        // never got a chance to run.
+        if awaiting_trim && ramp_pos == 0 {
+            let dropped = {
+                let mut buf = ring.lock().unwrap();
+                buf.trim_excess(max_backlog, target_backlog)
+            };
+            awaiting_trim = false;
+            ramp_target_pos = fade_total_frames; // phase 3: fade back in
+            if dropped > 0 {
+                // Two relaxed atomic adds. Deliberately NOT an eprintln!: that
+                // would allocate a String and take the process-wide stderr lock
+                // inside the render period. A summary is printed once when the
+                // loop exits, and TrimStats::snapshot exposes the live totals.
+                trim_stats.record((dropped / samples_per_ms) as u32);
+            }
         }
 
-        // Bound pipeline latency: cut the backlog back down if clock drift
-        // has let it grow past the threshold (see constants above).
-        let dropped = {
-            let mut buf = ring.lock().unwrap();
-            buf.trim_excess(max_backlog, target_backlog)
-        };
-        if dropped > 0 {
-            fade_frames_left = fade_total_frames;
-            eprintln!(
-                "[eq-audio] latency trim: dropped {} ms of drift backlog",
-                dropped / samples_per_ms.max(1)
-            );
+        if available_frames == 0 {
+            // Nothing to render this period, so the post-drain backlog check
+            // further down never runs. Do the over-budget check here instead:
+            // with nothing draining, a high reading is unambiguously real.
+            if !awaiting_trim && ring.lock().unwrap().available() > max_backlog {
+                ramp_target_pos = 0;
+                awaiting_trim = true;
+            }
+            continue;
         }
 
         // unsafe: GetBuffer returns a pointer to available_frames * channels * 4 bytes
@@ -552,24 +682,41 @@ fn run_render_loop(
         let vol  = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
         let gain = f32::from_bits(output_gain.load(Ordering::Relaxed)).clamp(0.0, 4.0);
         let combined = vol * gain;
-        if fade_frames_left > 0 {
-            // Post-trim fade-in: scale each output frame by a ramp that rises
-            // from 0 to 1 over fade_total_frames, folding the volume scalar in
-            // at the same time. All channels of a frame get the same gain so
-            // the stereo image is unaffected. Frames past the end of the ramp
-            // (within this same buffer) fall through to full level naturally.
+        // The trim ramp (see the state machine with the constants above) is
+        // folded into the same multiply. With no trim in flight the ramp sits
+        // at 1.0 and this collapses to the plain scalar path, so the common
+        // case costs exactly what it did before.
+        if ramp_pos != fade_total_frames || ramp_target_pos != fade_total_frames {
             let ch = format.channels as usize;
+            let inv_total = 1.0 / fade_total_frames as f32;
             for frame in render_slice.chunks_exact_mut(ch) {
-                let ramp = 1.0 - (fade_frames_left as f32 / fade_total_frames as f32);
-                let g = combined * ramp;
+                // Advance the ramp one frame toward its target, clamping so the
+                // final step cannot overshoot. Every channel of a frame shares
+                // the same gain, so the stereo image is unaffected.
+                ramp_pos = step_ramp_pos(ramp_pos, ramp_target_pos);
+                let g = combined * (ramp_pos as f32 * inv_total);
                 for s in frame.iter_mut() {
                     *s = (*s * g).clamp(-1.0, 1.0);
                 }
-                fade_frames_left = fade_frames_left.saturating_sub(1);
             }
         } else if (combined - 1.0).abs() > 0.0001 {
             for s in render_slice.iter_mut() {
                 *s = (*s * combined).clamp(-1.0, 1.0);
+            }
+        }
+
+        // Phase 1 of the trim state machine: is the backlog over budget?
+        //
+        // Measured AFTER the drain above, never before. A pre-drain reading is
+        // misleading on the first wake following a render-side stall: the device
+        // buffer has emptied, `available_frames` is unusually large, and this
+        // very iteration is about to consume the apparent excess. Only what
+        // survives the drain is genuinely accumulated latency.
+        if !awaiting_trim && ramp_target_pos != 0 {
+            let backlog = ring.lock().unwrap().available();
+            if backlog > max_backlog {
+                ramp_target_pos = 0; // fade out; the cut follows at silence
+                awaiting_trim = true;
             }
         }
 
@@ -582,6 +729,19 @@ fn run_render_loop(
             eprintln!("[eq-audio] ReleaseBuffer (render): {e}");
             break;
         }
+    }
+
+    // Off the hot path: the loop has exited and this thread is winding down, so
+    // formatting and stderr are free here. One line beats one per trim, and it
+    // is the only place in this function permitted to print during normal
+    // operation. (The `eprintln!`s inside the loop above are all on terminal
+    // error paths that `break` immediately — they fire once, on the way out.)
+    let (trim_count, trim_ms) = trim_stats.snapshot();
+    if trim_count > 0 {
+        eprintln!(
+            "[eq-audio] render loop exiting: {trim_count} latency trim(s), \
+             {trim_ms} ms of drift backlog discarded in total"
+        );
     }
 }
 
@@ -777,6 +937,22 @@ mod tests {
         assert_eq!(out, [3.0, 4.0, 5.0, 6.0]);
     }
 
+    // --- TrimStats ---
+
+    #[test]
+    fn trim_stats_accumulate_count_and_total() {
+        let stats = TrimStats::default();
+        assert_eq!(stats.snapshot(), (0, 0), "a fresh renderer has recorded nothing");
+
+        stats.record(40);
+        stats.record(37);
+        assert_eq!(
+            stats.snapshot(),
+            (2, 77),
+            "each trim must bump the count and add its milliseconds to the total"
+        );
+    }
+
     #[test]
     fn trim_excess_is_noop_within_bounds() {
         let mut buf = SampleBuffer::new(16);
@@ -796,6 +972,58 @@ mod tests {
         buf.read_into(&mut out);
         assert_eq!(out, [5.0, 6.0]);
         assert_eq!(buf.available(), 0);
+    }
+
+    // --- Trim-masking ramp (step_ramp_pos) ---
+    //
+    // The ramp is what makes a drift trim inaudible: the render loop must be
+    // able to reach *exactly* position 0 (so the ring is spliced at silence)
+    // and then return to exactly full level. Integer positions are what make
+    // both endpoints exact — an accumulated f32 ramp lands on 7.9e-7 instead
+    // of 0.0 after 240 steps, and the pending trim would never be released.
+
+    #[test]
+    fn step_ramp_pos_fades_out_to_exactly_zero() {
+        let total = 240; // 5 ms at 48 kHz
+        let mut pos = total;
+        for _ in 0..total {
+            pos = step_ramp_pos(pos, 0);
+        }
+        assert_eq!(pos, 0, "must land exactly on 0 so the pending trim can fire");
+    }
+
+    #[test]
+    fn step_ramp_pos_fades_in_to_exactly_full_level() {
+        let total = 240;
+        let mut pos = 0;
+        for _ in 0..total {
+            pos = step_ramp_pos(pos, total);
+        }
+        assert_eq!(pos, total, "must settle exactly at full level (the cheap path)");
+    }
+
+    #[test]
+    fn step_ramp_pos_is_continuous_and_idempotent_at_target() {
+        // Never moves more than one position per frame — this is what keeps the
+        // rendered waveform continuous across buffer boundaries.
+        assert_eq!(step_ramp_pos(240, 0), 239);
+        assert_eq!(step_ramp_pos(0, 240), 1);
+        // Already at target: a fixed point, so the cheap path stays cheap.
+        assert_eq!(step_ramp_pos(240, 240), 240);
+        assert_eq!(step_ramp_pos(0, 0), 0);
+        // Reversing mid-fade is safe: no underflow at the bottom of the range.
+        assert_eq!(step_ramp_pos(1, 0), 0);
+        assert_eq!(step_ramp_pos(0, 0), 0);
+    }
+
+    #[test]
+    fn step_ramp_pos_gain_endpoints_are_exact() {
+        // The loop converts position to gain as `pos / total`; both ends must be
+        // exact so a faded-out buffer is true silence and a restored one is unity.
+        let total = 240usize;
+        let inv = 1.0f32 / total as f32;
+        assert_eq!(0usize as f32 * inv, 0.0);
+        assert_eq!(total as f32 * inv, 1.0);
     }
 
     #[test]
