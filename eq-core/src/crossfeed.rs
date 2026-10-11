@@ -223,7 +223,7 @@ impl CrossfeedProcessor {
         let c  = self.blend;
         let c1 = 1.0 - c; // direct-path weight
 
-        for frame in buffer.chunks_exact_mut(2) {
+        for frame in buffer.as_chunks_mut::<2>().0 {
             let l = frame[0] as f64;
             let r = frame[1] as f64;
 

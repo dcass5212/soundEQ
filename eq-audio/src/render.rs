@@ -804,7 +804,7 @@ fn open_render_device(
     unsafe { CoTaskMemFree(Some(fmt_ptr.cast())) };
 
     let stream_format = parse_result?;
-    init_result?;
+    init_result.map_err(|e| AudioError::from_initialize(e, "output"))?;
 
     // Register the caller's event with the audio client. Required when
     // EVENTCALLBACK is set; must happen after Initialize and before Start.

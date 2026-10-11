@@ -190,11 +190,12 @@ impl FilterChain {
             return;
         }
 
-        // Walk through sample pairs (L, R)
-        // chunk_exact_mut(2) is safe here because WASAPI always gives us
+        // Walk through sample pairs (L, R) as fixed-size [f32; 2] arrays.
+        // as_chunks_mut::<2>() is safe here because WASAPI always gives us
         // even-length interleaved stereo buffers. We assert this in the
-        // WASAPI integration layer.
-        for chunk in buffer.chunks_exact_mut(2) {
+        // WASAPI integration layer. (Any odd trailing sample lands in the
+        // ignored remainder, same as chunks_exact_mut would.)
+        for chunk in buffer.as_chunks_mut::<2>().0 {
             // Promote f32 → f64 for internal processing
             let mut l = chunk[0] as f64;
             let mut r = chunk[1] as f64;

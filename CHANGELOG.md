@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI clippy failure on newer stable Rust** — clippy's new `chunks_exact_to_as_chunks` lint (on by default, and fatal under CI's `-D warnings`) flagged the two constant-size `chunks_exact_mut(2)` loops. They now use `as_chunks_mut::<2>().0`, which is behaviourally identical (fixed `[f32; 2]` frames, odd trailing sample ignored).
+  - `eq-core/src/filter_chain.rs`, `eq-core/src/crossfeed.rs`
+
+- **Opaque `0x8889000A` error when a device is held exclusively** — `IAudioClient::Initialize` returning `AUDCLNT_E_DEVICE_IN_USE` surfaced as a bare "Windows API error". Since soundEQ only opens devices in shared mode, this code always means another application has the endpoint in exclusive mode. It now maps to a new `AudioError::DeviceInUse` that names the side (output/capture) and tells the user how to release it.
+  - `eq-audio/src/error.rs` — `DeviceInUse` variant, `AudioError::from_initialize`
+  - `eq-audio/src/render.rs`, `eq-audio/src/capture.rs` — `Initialize` results routed through it
+
 ## [1.1.0] - 2026-08-24
 
 ### Added

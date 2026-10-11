@@ -517,7 +517,7 @@ fn open_loopback(capture_device_id: Option<&str>) -> Result<(IAudioClient, IAudi
     unsafe { CoTaskMemFree(Some(fmt_ptr.cast())) };
 
     let stream_format = parse_result?;
-    init_result?;
+    init_result.map_err(|e| AudioError::from_initialize(e, "capture"))?;
 
     // Get the IAudioCaptureClient service from the initialised audio client.
     // unsafe: audio_client has been successfully initialised immediately above.

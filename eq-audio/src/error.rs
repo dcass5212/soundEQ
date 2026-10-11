@@ -7,6 +7,7 @@
 // =============================================================================
 
 use thiserror::Error;
+use windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_IN_USE;
 
 /// All the ways an audio operation can fail.
 #[derive(Debug, Error)]
@@ -45,6 +46,24 @@ pub enum AudioError {
     )]
     SampleRateMismatch { capture: u32, render: u32 },
 
+    /// IAudioClient::Initialize returned AUDCLNT_E_DEVICE_IN_USE (0x8889000A).
+    ///
+    /// We only ever open devices in SHARED mode, and a shared-mode stream is
+    /// refused with this code only when another process holds the endpoint in
+    /// EXCLUSIVE mode (DAWs, some games and media players, and OEM audio
+    /// suites like Nahimic / Sonic Studio / Dolby). If an exclusive app grabs
+    /// the device mid-stream, our stream is invalidated and the auto-restart
+    /// fails with this same error until that app lets go.
+    ///
+    /// Fix: close the app holding the device, or untick "Allow applications to
+    /// take exclusive control of this device" for that endpoint.
+    #[error(
+        "the {device} device is being used exclusively by another application (0x8889000A) — \
+         close that app, or untick \"Allow applications to take exclusive control of this device\" \
+         in Sound Control Panel → (device) → Properties → Advanced"
+    )]
+    DeviceInUse { device: &'static str },
+
     /// The capture thread failed to start (OS-level thread creation failure).
     #[error("capture thread could not be started: {0}")]
     ThreadSpawn(#[from] std::io::Error),
@@ -57,4 +76,18 @@ pub enum AudioError {
     /// Attempted to start a capture session that is already running.
     #[error("capture is already running — call stop() before starting again")]
     AlreadyRunning,
+}
+
+impl AudioError {
+    /// Converts an `IAudioClient::Initialize` failure, singling out the
+    /// "device held in exclusive mode" case so the user gets an actionable
+    /// message instead of a bare HRESULT. `device` names which side failed
+    /// ("output" or "capture") since the fix applies per endpoint.
+    pub(crate) fn from_initialize(e: windows::core::Error, device: &'static str) -> Self {
+        if e.code() == AUDCLNT_E_DEVICE_IN_USE {
+            AudioError::DeviceInUse { device }
+        } else {
+            AudioError::Windows(e)
+        }
+    }
 }
